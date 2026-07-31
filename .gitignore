@@ -1,0 +1,11 @@
+# Build artifacts
+emulator/build/
+build/
+
+# Generated files
+emulator/roms/pcvd_bios.bin
+emulator/roms/test_code.bin
+
+# Object files
+*.o
+*.obj
