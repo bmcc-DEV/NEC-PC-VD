@@ -46,6 +46,9 @@ tests: $(BIN)
 	$(CC) $(CFLAGS) -o $(BUILD)/glide_test tests/glide_test.c \
 		src/glide_api.c src/voodoo2_ec.c src/voodoo_fifo.c src/bus.c -lm
 	./$(BUILD)/glide_test
+	$(CC) $(CFLAGS) -o $(BUILD)/pipeline_test tests/pipeline_test.c \
+		src/vr5432.c src/bus.c -lm
+	./$(BUILD)/pipeline_test
 	./$(BIN)
 
 clean:

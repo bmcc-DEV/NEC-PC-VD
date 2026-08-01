@@ -87,7 +87,22 @@ typedef struct Vr5432 {
     uint64_t branch_target;
 
     bool halted;
-    uint64_t cycles;
+    uint64_t cycles;    /* modeled superscalar cycle count */
+
+    /* ---- dual-issue superscalar pipeline model ----
+     * Two pipes (INT and FPU); an INT instruction and an independent FPU
+     * instruction can issue in the same cycle. `cycles` is the completion
+     * cycle of the latest instruction. */
+    uint64_t pipe_int_free;   /* cycle when the INT pipe is free */
+    uint64_t pipe_fpu_free;   /* cycle when the FPU pipe is free */
+    uint64_t gpr_ready[32];   /* cycle when each GPR value is ready */
+    uint64_t fpr_ready[32];   /* cycle when each FPR value is ready */
+    uint64_t hilo_ready;      /* cycle when HI/LO are ready */
+    int last_pipe;            /* 0=INT, 1=FPU, -1 = none */
+    int last_structural;
+    int last_dest_kind;       /* 0=none, 1=GPR, 2=FPR, 3=HI/LO */
+    int last_dest_reg;
+    uint64_t last_issue;      /* issue cycle of the previous instruction */
 } Vr5432;
 
 void vr5432_reset(Vr5432* cpu, Bus* bus);

@@ -260,6 +260,9 @@ void vr5432_reset(Vr5432* cpu, Bus* bus) {
     cpu->llbit = 0;
     cpu->halted = false;
     cpu->cycles = 0;
+    cpu->last_pipe = -1;
+    cpu->last_structural = 0;
+    cpu->last_issue = 0;
 }
 
 uint64_t vr5432_get_gpr(const Vr5432* cpu, int reg) { return cpu->gpr[reg & 31]; }
@@ -271,6 +274,337 @@ void vr5432_set_pc(Vr5432* cpu, uint64_t pc) { cpu->pc = pc; }
 uint64_t vr5432_get_cycles(const Vr5432* cpu) { return cpu->cycles; }
 void vr5432_set_fpr_single(Vr5432* cpu, int reg, float value) { set_fpr_s(cpu, reg, value); }
 float vr5432_get_fpr_single(const Vr5432* cpu, int reg) { return fpr_s((Vr5432*)cpu, reg); }
+
+/* ------------------------------------------------------------------ */
+/* dual-issue superscalar cycle model                                  */
+/*                                                                     */
+/* Two pipes (INT and FPU). An INT instruction and an independent FPU  */
+/* instruction can issue in the same cycle. `cycles` is the completion */
+/* cycle of the latest instruction; RAW dependencies stall issue.      */
+/* ------------------------------------------------------------------ */
+
+enum { PIPE_INT = 0, PIPE_FPU = 1 };
+enum { K_NONE = 0, K_GPR = 1, K_FPR = 2, K_HILO = 3 };
+
+typedef struct {
+    int pipe;
+    int latency;
+    bool structural;
+    int dest_kind;
+    int dest_reg;
+    bool dest_wide;         /* writes FPR pair (fd, fd+1) */
+    int nsrc;
+    int src_kind[3];
+    int src_reg[3];
+} InsnInfo;
+
+static void classify_cop1(uint32_t insn, InsnInfo* ii);
+
+static void classify_insn(uint32_t insn, InsnInfo* ii) {
+    memset(ii, 0, sizeof(*ii));
+    ii->pipe = PIPE_INT;
+    ii->latency = 1;
+    ii->dest_kind = K_NONE;
+    ii->dest_reg = -1;
+    uint32_t op = insn >> 26;
+    uint32_t rs = (insn >> 21) & 0x1F;
+    uint32_t rt = (insn >> 16) & 0x1F;
+    uint32_t rd = (insn >> 11) & 0x1F;
+    uint32_t sa = (insn >> 6) & 0x1F;
+    uint32_t funct = insn & 0x3F;
+
+    switch (op) {
+    case 0x00:
+        switch (funct) {
+        case 0x00: case 0x02: case 0x03:          /* SLL/SRL/SRA */
+        case 0x38: case 0x3A: case 0x3B:
+        case 0x3C: case 0x3E: case 0x3F:          /* DSLL/DSRL/DSRA(+32) */
+            ii->dest_kind = K_GPR; ii->dest_reg = rd;
+            ii->src_kind[0] = K_GPR; ii->src_reg[0] = rt; ii->nsrc = 1;
+            break;
+        case 0x04: case 0x06: case 0x07:
+        case 0x14: case 0x16: case 0x17:          /* SLLV/SRLV/SRAV/DSLLV/... */
+            ii->dest_kind = K_GPR; ii->dest_reg = rd;
+            ii->src_kind[0] = K_GPR; ii->src_reg[0] = rt;
+            ii->src_kind[1] = K_GPR; ii->src_reg[1] = rs; ii->nsrc = 2;
+            break;
+        case 0x08: case 0x09:                     /* JR/JALR */
+            ii->structural = true; ii->latency = 2;
+            ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
+            break;
+        case 0x0A: case 0x0B:                     /* MOVZ/MOVN */
+            ii->dest_kind = K_GPR; ii->dest_reg = rd;
+            ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs;
+            ii->src_kind[1] = K_GPR; ii->src_reg[1] = rt; ii->nsrc = 2;
+            break;
+        case 0x0C: case 0x0D: case 0x0F:         /* SYSCALL/BREAK/SYNC */
+            ii->structural = true;
+            break;
+        case 0x10: case 0x12:                     /* MFHI/MFLO */
+            ii->dest_kind = K_GPR; ii->dest_reg = rd;
+            ii->src_kind[0] = K_HILO; ii->nsrc = 1;
+            break;
+        case 0x11: case 0x13:                     /* MTHI/MTLO */
+            ii->dest_kind = K_HILO;
+            ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
+            break;
+        case 0x18: case 0x19: case 0x1C: case 0x1D:   /* MULT/MULTU/DMULT/DMULTU */
+            ii->latency = 5; ii->dest_kind = K_HILO;
+            ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs;
+            ii->src_kind[1] = K_GPR; ii->src_reg[1] = rt; ii->nsrc = 2;
+            break;
+        case 0x1A: case 0x1B:                     /* DIV/DIVU */
+            ii->latency = 36; ii->dest_kind = K_HILO;
+            ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs;
+            ii->src_kind[1] = K_GPR; ii->src_reg[1] = rt; ii->nsrc = 2;
+            break;
+        case 0x1E: case 0x1F:                     /* DDIV/DDIVU */
+            ii->latency = 68; ii->dest_kind = K_HILO;
+            ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs;
+            ii->src_kind[1] = K_GPR; ii->src_reg[1] = rt; ii->nsrc = 2;
+            break;
+        case 0x20: case 0x21: case 0x22: case 0x23:
+        case 0x24: case 0x25: case 0x26: case 0x27:
+        case 0x2A: case 0x2B: case 0x2C: case 0x2D:
+        case 0x2E: case 0x2F:
+            ii->dest_kind = K_GPR; ii->dest_reg = rd;
+            ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs;
+            ii->src_kind[1] = K_GPR; ii->src_reg[1] = rt; ii->nsrc = 2;
+            break;
+        case 0x30: case 0x31: case 0x32: case 0x33:
+        case 0x34: case 0x36:                     /* traps */
+            ii->structural = true;
+            break;
+        default:
+            break;
+        }
+        break;
+    case 0x01:                                    /* REGIMM branches */
+        ii->structural = true; ii->latency = 2;
+        ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
+        break;
+    case 0x02: case 0x03:                         /* J/JAL */
+        ii->structural = true; ii->latency = 2;
+        break;
+    case 0x04: case 0x05: case 0x06: case 0x07:
+    case 0x14: case 0x15: case 0x16: case 0x17:   /* branches */
+        ii->structural = true; ii->latency = 2;
+        ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
+        if (op == 0x04 || op == 0x05 || op == 0x14 || op == 0x15) {
+            ii->src_kind[1] = K_GPR; ii->src_reg[1] = rt; ii->nsrc = 2;
+        }
+        break;
+    case 0x08: case 0x09: case 0x0A: case 0x0B:
+    case 0x18: case 0x19:                         /* ADDI/ADDIU/.../DADDI/DADDIU */
+        ii->dest_kind = K_GPR; ii->dest_reg = rt;
+        ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
+        break;
+    case 0x0C: case 0x0D: case 0x0E:             /* ANDI/ORI/XORI */
+        ii->dest_kind = K_GPR; ii->dest_reg = rt;
+        ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
+        break;
+    case 0x0F:                                    /* LUI */
+        ii->dest_kind = K_GPR; ii->dest_reg = rt;
+        break;
+    case 0x10:                                    /* COP0 */
+        if (rs == 0x10) ii->structural = true;    /* TLB/ERET */
+        else { ii->latency = 2; if (rs == 0x00) { ii->dest_kind = K_GPR; ii->dest_reg = rt; } }
+        break;
+    case 0x11:                                    /* COP1 */
+        classify_cop1(insn, ii);
+        break;
+    case 0x13:                                    /* COP1X MADD/MSUB */
+        ii->pipe = PIPE_FPU;
+        ii->latency = 4;
+        ii->dest_kind = K_FPR; ii->dest_reg = rt;
+        ii->src_kind[0] = K_FPR; ii->src_reg[0] = rd;
+        ii->src_kind[1] = K_FPR; ii->src_reg[1] = sa; ii->nsrc = 2;
+        break;
+    case 0x1A: case 0x1B:
+    case 0x20: case 0x21: case 0x22: case 0x23:
+    case 0x24: case 0x25: case 0x26: case 0x27:
+    case 0x30: case 0x36:                         /* loads */
+        ii->latency = 2;
+        ii->dest_kind = K_GPR; ii->dest_reg = rt;
+        ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
+        break;
+    case 0x28: case 0x29: case 0x2A: case 0x2B:
+    case 0x2C: case 0x2D: case 0x2E: case 0x2F:
+    case 0x37: case 0x3D:                         /* stores */
+        ii->structural = true;
+        ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
+        if (op != 0x2F) { ii->src_kind[1] = K_GPR; ii->src_reg[1] = rt; ii->nsrc = 2; }
+        break;
+    case 0x31:                                    /* LWC1 */
+        ii->pipe = PIPE_FPU; ii->latency = 2;
+        ii->dest_kind = K_FPR; ii->dest_reg = rt;
+        ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
+        break;
+    case 0x34:                                    /* LDC1 */
+        ii->pipe = PIPE_FPU; ii->latency = 3;
+        ii->dest_kind = K_FPR; ii->dest_reg = rt; ii->dest_wide = true;
+        ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
+        break;
+    case 0x38: case 0x3B:                         /* SWC1/SDC1 */
+        ii->structural = true;
+        ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs;
+        ii->src_kind[1] = K_FPR; ii->src_reg[1] = rt; ii->nsrc = 2;
+        break;
+    default:
+        break;
+    }
+}
+
+static void classify_cop1(uint32_t insn, InsnInfo* ii) {
+    uint32_t fmt = (insn >> 21) & 0x1F;
+    uint32_t rt = (insn >> 16) & 0x1F;
+    uint32_t fs = (insn >> 11) & 0x1F;
+    uint32_t fd = (insn >> 6) & 0x1F;
+    uint32_t funct = insn & 0x3F;
+    ii->pipe = PIPE_FPU;
+
+    switch (fmt) {
+    case 0x00: case 0x01:                        /* MFC1/DMFC1 */
+        ii->latency = 2; ii->dest_kind = K_GPR; ii->dest_reg = rt;
+        ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs; ii->nsrc = 1;
+        break;
+    case 0x02: case 0x06:                        /* CFC1/CTC1 */
+        ii->latency = 2;
+        break;
+    case 0x04: case 0x05:                        /* MTC1/DMTC1 */
+        ii->latency = 2;
+        ii->dest_kind = K_FPR; ii->dest_reg = fs;
+        ii->dest_wide = (fmt == 0x05);
+        ii->src_kind[0] = K_GPR; ii->src_reg[0] = rt; ii->nsrc = 1;
+        break;
+    case 0x08:                                    /* BC1 */
+        ii->structural = true; ii->latency = 2;
+        break;
+    case 0x10: case 0x11: {
+        bool d = (fmt == 0x11);
+        ii->dest_kind = K_FPR; ii->dest_reg = fd;
+        switch (funct) {
+        case 0x00: case 0x01:                     /* ADD/SUB */
+            ii->latency = d ? 3 : 2;
+            ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs;
+            ii->src_kind[1] = K_FPR; ii->src_reg[1] = rt; ii->nsrc = 2;
+            break;
+        case 0x02:                                /* MUL */
+            ii->latency = d ? 6 : 5;
+            ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs;
+            ii->src_kind[1] = K_FPR; ii->src_reg[1] = rt; ii->nsrc = 2;
+            break;
+        case 0x03:                                /* DIV */
+            ii->latency = d ? 18 : 12;
+            ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs;
+            ii->src_kind[1] = K_FPR; ii->src_reg[1] = rt; ii->nsrc = 2;
+            break;
+        case 0x04:                                /* SQRT */
+            ii->latency = d ? 34 : 20;
+            ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs; ii->nsrc = 1;
+            break;
+        case 0x05: case 0x06: case 0x07:         /* ABS/MOV/NEG */
+            ii->latency = 1;
+            ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs; ii->nsrc = 1;
+            break;
+        case 0x08: case 0x09: case 0x0A: case 0x0B:   /* ROUND.L/TRUNC.L/CEIL.L/FLOOR.L */
+        case 0x0C: case 0x0D: case 0x0E: case 0x0F:   /* ROUND.W/TRUNC.W/CEIL.W/FLOOR.W */
+        case 0x14: case 0x15: case 0x16:              /* CVT.D.S / CVT.W.S / CVT.L.S */
+        case 0x20: case 0x21: case 0x22:              /* CVT.S.D / CVT.W.D / CVT.L.D */
+            ii->latency = 2;
+            ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs; ii->nsrc = 1;
+            break;
+        case 0x45: case 0x4A:                    /* RECIP.S / RSQRT.S */
+            ii->latency = 13;
+            ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs; ii->nsrc = 1;
+            break;
+        case 0x46: case 0x4B:                    /* RECIP.D / RSQRT.D */
+            ii->latency = 26;
+            ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs; ii->nsrc = 1;
+            break;
+        default:
+            if ((funct >= 0x30 && funct <= 0x3F) || (funct >= 0x48 && funct <= 0x4F)) {
+                /* C.cond */
+                ii->latency = 1; ii->dest_kind = K_NONE;
+                ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs;
+                ii->src_kind[1] = K_FPR; ii->src_reg[1] = rt; ii->nsrc = 2;
+            }
+            break;
+        }
+        ii->dest_wide = d;
+        if (funct == 0x08 || funct == 0x09 || funct == 0x0A || funct == 0x0B ||
+            funct == 0x16 || funct == 0x22)
+            ii->dest_wide = true;                 /* .L and .D results are FPR pairs */
+        break;
+    }
+    case 0x14:                                    /* W conversions */
+        ii->latency = 2;
+        ii->dest_kind = K_FPR; ii->dest_reg = fd;
+        ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs; ii->nsrc = 1;
+        ii->dest_wide = (funct == 0x22);          /* CVT.L.W -> pair */
+        break;
+    case 0x15:                                    /* L conversions */
+        ii->latency = 2;
+        ii->dest_kind = K_FPR; ii->dest_reg = fd;
+        ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs;
+        ii->src_kind[1] = K_FPR; ii->src_reg[1] = fs + 1; ii->nsrc = 2;
+        ii->dest_wide = (funct == 0x21);          /* CVT.D.L -> pair */
+        break;
+    default:
+        break;
+    }
+}
+
+static void account_pipeline(Vr5432* c, const InsnInfo* ii) {
+    uint64_t ready = 0;
+    for (int i = 0; i < ii->nsrc; i++) {
+        uint64_t r = 0;
+        switch (ii->src_kind[i]) {
+        case K_GPR: r = c->gpr_ready[ii->src_reg[i] & 31]; break;
+        case K_FPR: r = c->fpr_ready[ii->src_reg[i] & 31]; break;
+        case K_HILO: r = c->hilo_ready; break;
+        default: break;
+        }
+        if (r > ready) ready = r;
+    }
+
+    uint64_t pipe_free = (ii->pipe == PIPE_FPU) ? c->pipe_fpu_free : c->pipe_int_free;
+    uint64_t issue;
+
+    /* dual issue: an INT instruction and an independent FPU instruction
+     * share a cycle (opposite pipes, both free at the previous issue) */
+    if (!ii->structural && !c->last_structural && c->last_pipe >= 0 &&
+        ii->pipe != c->last_pipe && ready <= c->last_issue &&
+        pipe_free <= c->last_issue) {
+        issue = c->last_issue;
+    } else {
+        issue = c->cycles;
+        if (pipe_free > issue) issue = pipe_free;
+        if (ready > issue) issue = ready;
+    }
+
+    uint64_t finish = issue + ii->latency;
+    if (ii->pipe == PIPE_FPU) c->pipe_fpu_free = finish;
+    else c->pipe_int_free = finish;
+    if (finish > c->cycles) c->cycles = finish;
+
+    switch (ii->dest_kind) {
+    case K_GPR: c->gpr_ready[ii->dest_reg & 31] = finish; break;
+    case K_FPR:
+        c->fpr_ready[ii->dest_reg & 31] = finish;
+        if (ii->dest_wide) c->fpr_ready[(ii->dest_reg + 1) & 31] = finish;
+        break;
+    case K_HILO: c->hilo_ready = finish; break;
+    default: break;
+    }
+
+    c->last_pipe = ii->pipe;
+    c->last_structural = ii->structural;
+    c->last_dest_kind = ii->dest_kind;
+    c->last_dest_reg = ii->dest_reg;
+    c->last_issue = issue;
+}
+
 
 static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay) {
     uint32_t op = OP(insn);
@@ -324,11 +658,11 @@ static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay
         case 0x18: { /* MULT */
             int64_t r = (int64_t)(int32_t)c->gpr[rs] * (int64_t)(int32_t)c->gpr[rt];
             c->lo = (uint64_t)(int64_t)r; c->hi = (uint64_t)((int64_t)r >> 32);
-            c->cycles += 4; break; }
+        break; }
         case 0x19: { /* MULTU */
             uint64_t r = (uint64_t)(uint32_t)c->gpr[rs] * (uint64_t)(uint32_t)c->gpr[rt];
             c->lo = r & 0xFFFFFFFF; c->hi = r >> 32;
-            c->cycles += 4; break; }
+        break; }
         case 0x1A: /* DIV */
             if ((int32_t)c->gpr[rt] != 0) {
                 int32_t a = (int32_t)c->gpr[rs], b = (int32_t)c->gpr[rt];
@@ -339,34 +673,34 @@ static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay
                     c->hi = (uint32_t)(a % b);
                 }
             }
-            c->cycles += 36; break;
+        break;
         case 0x1B: /* DIVU */
             if ((uint32_t)c->gpr[rt] != 0) {
                 c->lo = (uint32_t)c->gpr[rs] / (uint32_t)c->gpr[rt];
                 c->hi = (uint32_t)c->gpr[rs] % (uint32_t)c->gpr[rt];
             }
-            c->cycles += 36; break;
+        break;
         case 0x1C: { /* DMULT */
             __int128_t r = (__int128_t)(int64_t)c->gpr[rs] * (int64_t)c->gpr[rt];
             c->lo = (uint64_t)r; c->hi = (uint64_t)(r >> 64);
-            c->cycles += 4; break; }
+        break; }
         case 0x1D: { /* DMULTU */
             uint64_t a = c->gpr[rs], b = c->gpr[rt];
             __uint128_t r = (__uint128_t)a * b;
             c->lo = (uint64_t)r; c->hi = (uint64_t)(r >> 64);
-            c->cycles += 4; break; }
+        break; }
         case 0x1E: /* DDIV */
             if ((int64_t)c->gpr[rt] != 0) {
                 int64_t a = (int64_t)c->gpr[rs], b = (int64_t)c->gpr[rt];
                 c->lo = (uint64_t)(a / b); c->hi = (uint64_t)(a % b);
             }
-            c->cycles += 68; break;
+        break;
         case 0x1F: /* DDIVU */
             if (c->gpr[rt] != 0) {
                 c->lo = c->gpr[rs] / c->gpr[rt];
                 c->hi = c->gpr[rs] % c->gpr[rt];
             }
-            c->cycles += 68; break;
+        break;
         case 0x20: { /* ADD */
             int64_t a = (int32_t)c->gpr[rs], b = (int32_t)c->gpr[rt];
             int64_t r = a + b;
@@ -755,31 +1089,31 @@ static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay
                 fb = is_d ? fpr_d(c, ft) : fpr_s(c, ft);
                 fr = fa + fb;
                 if (is_d) set_fpr_d(c, fd, fr); else set_fpr_s(c, fd, (float)fr);
-                c->cycles += 2; break;
+        break;
             case 0x01: /* SUB */
                 fa = is_d ? fpr_d(c, fs) : fpr_s(c, fs);
                 fb = is_d ? fpr_d(c, ft) : fpr_s(c, ft);
                 fr = fa - fb;
                 if (is_d) set_fpr_d(c, fd, fr); else set_fpr_s(c, fd, (float)fr);
-                c->cycles += 2; break;
+        break;
             case 0x02: /* MUL */
                 fa = is_d ? fpr_d(c, fs) : fpr_s(c, fs);
                 fb = is_d ? fpr_d(c, ft) : fpr_s(c, ft);
                 fr = fa * fb;
                 if (is_d) set_fpr_d(c, fd, fr); else set_fpr_s(c, fd, (float)fr);
-                c->cycles += 2; break;
+        break;
             case 0x03: /* DIV */
                 fa = is_d ? fpr_d(c, fs) : fpr_s(c, fs);
                 fb = is_d ? fpr_d(c, ft) : fpr_s(c, ft);
                 if (fb == 0.0) fpu_set_flag(c, FCR31_FLAG_DIV0);
                 fr = fa / fb;
                 if (is_d) set_fpr_d(c, fd, fr); else set_fpr_s(c, fd, (float)fr);
-                c->cycles += 12; break;
+        break;
             case 0x04: /* SQRT */
                 fa = is_d ? fpr_d(c, fs) : fpr_s(c, fs);
                 fr = sqrt(fa);
                 if (is_d) set_fpr_d(c, fd, fr); else set_fpr_s(c, fd, (float)fr);
-                c->cycles += 12; break;
+        break;
             case 0x05: /* ABS */
                 fa = is_d ? fpr_d(c, fs) : fpr_s(c, fs);
                 fr = fabs(fa);
@@ -846,16 +1180,16 @@ static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay
                 break;
             case 0x45: /* RECIP.S */
                 set_fpr_s(c, fd, 1.0f / fpr_s(c, fs));
-                c->cycles += 12; break;
+        break;
             case 0x4A: /* RSQRT.S */
                 set_fpr_s(c, fd, 1.0f / sqrtf(fpr_s(c, fs)));
-                c->cycles += 12; break;
+        break;
             case 0x46: /* RECIP.D */
                 set_fpr_d(c, fd, 1.0 / fpr_d(c, fs));
-                c->cycles += 12; break;
+        break;
             case 0x4B: /* RSQRT.D */
                 set_fpr_d(c, fd, 1.0 / sqrt(fpr_d(c, fs)));
-                c->cycles += 12; break;
+        break;
             default:
                 /* C.cond.S = 0x30-0x3F, C.cond.D = 0x48-0x4F */
                 if (funct >= 0x30 && funct <= 0x3F) {
@@ -904,7 +1238,7 @@ static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay
             fd0 = is_d ? fpr_d(c, frreg) : fpr_s(c, frreg);
             fr = fd0 + fa * fb;
             if (is_d) set_fpr_d(c, frreg, fr); else set_fpr_s(c, frreg, (float)fr);
-            c->cycles += 4; break;
+        break;
         case 0x01: /* MADD.PS (unimplemented) */ break;
         case 0x04: /* MSUB.S/D */
             fa = is_d ? fpr_d(c, fs) : fpr_s(c, fs);
@@ -912,21 +1246,21 @@ static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay
             fd0 = is_d ? fpr_d(c, frreg) : fpr_s(c, frreg);
             fr = fd0 - fa * fb;
             if (is_d) set_fpr_d(c, frreg, fr); else set_fpr_s(c, frreg, (float)fr);
-            c->cycles += 4; break;
+        break;
         case 0x08: /* NMADD.S/D */
             fa = is_d ? fpr_d(c, fs) : fpr_s(c, fs);
             fb = is_d ? fpr_d(c, ft) : fpr_s(c, ft);
             fd0 = is_d ? fpr_d(c, frreg) : fpr_s(c, frreg);
             fr = -(fd0 + fa * fb);
             if (is_d) set_fpr_d(c, frreg, fr); else set_fpr_s(c, frreg, (float)fr);
-            c->cycles += 4; break;
+        break;
         case 0x0C: /* NMSUB.S/D */
             fa = is_d ? fpr_d(c, fs) : fpr_s(c, fs);
             fb = is_d ? fpr_d(c, ft) : fpr_s(c, ft);
             fd0 = is_d ? fpr_d(c, frreg) : fpr_s(c, frreg);
             fr = -(fd0 - fa * fb);
             if (is_d) set_fpr_d(c, frreg, fr); else set_fpr_s(c, frreg, (float)fr);
-            c->cycles += 4; break;
+        break;
         default:
             break;
         }
@@ -977,7 +1311,11 @@ void vr5432_step(Vr5432* c) {
 
     execute(c, insn, inst_addr, was_delay);
 
-    c->cycles++;
+    /* superscalar dual-issue cycle accounting */
+    InsnInfo ii;
+    classify_insn(insn, &ii);
+    account_pipeline(c, &ii);
+
     /* COP0 count/compare timer */
     uint64_t count = c->cp0[CP0_COUNT] + 1;
     c->cp0[CP0_COUNT] = count;
