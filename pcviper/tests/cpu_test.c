@@ -34,9 +34,12 @@ static uint32_t cop1(uint32_t fmt, uint32_t ft, uint32_t fs, uint32_t fd,
                      uint32_t funct) {
     return (0x11u << 26) | (fmt << 21) | (ft << 16) | (fs << 11) | (fd << 6) | funct;
 }
-static uint32_t cop1x(uint32_t fmt, uint32_t fr, uint32_t fs, uint32_t ft,
+static uint32_t cop1x(uint32_t fr, uint32_t ft, uint32_t fs, uint32_t fd,
                       uint32_t funct) {
-    return (0x13u << 26) | (fmt << 21) | (fr << 16) | (fs << 11) | (ft << 6) | funct;
+    /* MIPS IV COP1X fields: fr=bits[25:21], ft=bits[20:16], fs=bits[15:11],
+     * fd=bits[10:6] (verified against llvm-mc: madd.s $f1,$f3,$f1,$f7 =
+     * 0x4C670860 -> fr=3, ft=7, fs=1, fd=1) */
+    return (0x13u << 26) | (fr << 21) | (ft << 16) | (fs << 11) | (fd << 6) | funct;
 }
 static uint32_t cop1_mov(uint32_t rs, uint32_t rt, uint32_t fs) {
     return (0x11u << 26) | (rs << 21) | (rt << 16) | (fs << 11);
@@ -206,7 +209,7 @@ int main(void) {
             cop1(0x14, 0, 4, 6, 0x20),              /* cvt.s.w $6, $4 (word 7 -> 7.0f) */
             cop1(0x14, 0, 4, 4, 0x20),              /* cvt.s.w $4, $4 (word 7 -> 7.0f) */
             cop1(0x10, 2, 6, 8, 0x00),              /* add.s $8, $2, $6 (fs=2,ft=6) */
-            cop1x(0x10, 4, 2, 6, 0x00),             /* madd.s f4 = f4 + f2*f6 */
+            cop1x(4, 6, 2, 4, 0x20),             /* madd.s f4 = f4 + f2*f6 */
             cop1(0x10, 0, 8, 10, 0x0D),             /* trunc.w.s $10, $8 */
             cop1_mov(0x00, 9, 10),                  /* mfc1 $9, $10 */
             cop1(0x10, 0, 4, 12, 0x0D),             /* trunc.w.s $12, $4 */

@@ -413,13 +413,17 @@ static void classify_insn(uint32_t insn, InsnInfo* ii) {
     case 0x11:                                    /* COP1 */
         classify_cop1(insn, ii);
         break;
-    case 0x13:                                    /* COP1X MADD/MSUB */
+    case 0x13: {                                  /* COP1X MADD/MSUB */
+        uint32_t fn = insn & 0x3F;
         ii->pipe = PIPE_FPU;
         ii->latency = 4;
-        ii->dest_kind = K_FPR; ii->dest_reg = rt;
-        ii->src_kind[0] = K_FPR; ii->src_reg[0] = rd;
-        ii->src_kind[1] = K_FPR; ii->src_reg[1] = sa; ii->nsrc = 2;
+        ii->dest_kind = K_FPR; ii->dest_reg = sa;
+        ii->dest_wide = (fn == 0x21 || fn == 0x29 || fn == 0x2D || fn == 0x31);
+        ii->src_kind[0] = K_FPR; ii->src_reg[0] = rs;    /* fr */
+        ii->src_kind[1] = K_FPR; ii->src_reg[1] = rt;    /* ft */
+        ii->src_kind[2] = K_FPR; ii->src_reg[2] = rd; ii->nsrc = 3;  /* fs */
         break;
+    }
     case 0x1A: case 0x1B:
     case 0x20: case 0x21: case 0x22: case 0x23:
     case 0x24: case 0x25: case 0x26: case 0x27:
@@ -503,9 +507,19 @@ static void classify_cop1(uint32_t insn, InsnInfo* ii) {
             ii->latency = d ? 34 : 20;
             ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs; ii->nsrc = 1;
             break;
-        case 0x05: case 0x06: case 0x07:         /* ABS/MOV/NEG */
+            case 0x05: case 0x06: case 0x07:         /* ABS/MOV/NEG */
+                ii->latency = 1;
+                ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs; ii->nsrc = 1;
+                break;
+        case 0x11:                                    /* MOVT.S */
             ii->latency = 1;
             ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs; ii->nsrc = 1;
+            ii->dest_kind = K_FPR; ii->dest_reg = fd;
+            break;
+        case 0x31:                                    /* MOVT.D */
+            ii->latency = 1;
+            ii->src_kind[0] = K_FPR; ii->src_reg[0] = fs; ii->nsrc = 1;
+            ii->dest_kind = K_FPR; ii->dest_reg = fd; ii->dest_wide = true;
             break;
         case 0x08: case 0x09: case 0x0A: case 0x0B:   /* ROUND.L/TRUNC.L/CEIL.L/FLOOR.L */
         case 0x0C: case 0x0D: case 0x0E: case 0x0F:   /* ROUND.W/TRUNC.W/CEIL.W/FLOOR.W */
@@ -1123,6 +1137,16 @@ static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay
                 if (is_d) set_fpr_d(c, fd, fpr_d(c, fs));
                 else set_fpr_s(c, fd, fpr_s(c, fs));
                 break;
+            case 0x11: /* MOVT (move if FPU condition true) */
+                if (c->fcr31 & FCR31_CC) {
+                    if (is_d) set_fpr_d(c, fd, fpr_d(c, fs));
+                    else set_fpr_s(c, fd, fpr_s(c, fs));
+                }
+                break;
+            case 0x31: /* MOVT.D */
+                if (c->fcr31 & FCR31_CC)
+                    set_fpr_d(c, fd, fpr_d(c, fs));
+                break;
             case 0x07: /* NEG */
                 fa = is_d ? fpr_d(c, fs) : fpr_s(c, fs);
                 fr = -fa;
@@ -1227,40 +1251,34 @@ static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay
 
     /* ---------------- COP1X (MIPS IV MADD/MSUB) ---------------- */
     case 0x13: {
-        uint32_t fmt = rs;
-        bool is_d = (fmt == 0x11);
-        double fa, fb, fr, fd0;
-        int frreg = rt, fs = rd, ft = sa;
+        /* COP1X fields: fr=bits[25:21], ft=bits[20:16], fs=bits[15:11],
+         * fd=bits[10:6] (MIPS IV, verified against llvm-mc) */
+        int fr = rs, ft = rt, fs = rd, fd = sa;
         switch (funct) {
-        case 0x00: /* MADD.S/D */
-            fa = is_d ? fpr_d(c, fs) : fpr_s(c, fs);
-            fb = is_d ? fpr_d(c, ft) : fpr_s(c, ft);
-            fd0 = is_d ? fpr_d(c, frreg) : fpr_s(c, frreg);
-            fr = fd0 + fa * fb;
-            if (is_d) set_fpr_d(c, frreg, fr); else set_fpr_s(c, frreg, (float)fr);
-        break;
-        case 0x01: /* MADD.PS (unimplemented) */ break;
-        case 0x04: /* MSUB.S/D */
-            fa = is_d ? fpr_d(c, fs) : fpr_s(c, fs);
-            fb = is_d ? fpr_d(c, ft) : fpr_s(c, ft);
-            fd0 = is_d ? fpr_d(c, frreg) : fpr_s(c, frreg);
-            fr = fd0 - fa * fb;
-            if (is_d) set_fpr_d(c, frreg, fr); else set_fpr_s(c, frreg, (float)fr);
-        break;
-        case 0x08: /* NMADD.S/D */
-            fa = is_d ? fpr_d(c, fs) : fpr_s(c, fs);
-            fb = is_d ? fpr_d(c, ft) : fpr_s(c, ft);
-            fd0 = is_d ? fpr_d(c, frreg) : fpr_s(c, frreg);
-            fr = -(fd0 + fa * fb);
-            if (is_d) set_fpr_d(c, frreg, fr); else set_fpr_s(c, frreg, (float)fr);
-        break;
-        case 0x0C: /* NMSUB.S/D */
-            fa = is_d ? fpr_d(c, fs) : fpr_s(c, fs);
-            fb = is_d ? fpr_d(c, ft) : fpr_s(c, ft);
-            fd0 = is_d ? fpr_d(c, frreg) : fpr_s(c, frreg);
-            fr = -(fd0 - fa * fb);
-            if (is_d) set_fpr_d(c, frreg, fr); else set_fpr_s(c, frreg, (float)fr);
-        break;
+        case 0x20: /* MADD.S */
+            set_fpr_s(c, fd, (float)(fpr_s(c, fr) + fpr_s(c, fs) * fpr_s(c, ft)));
+            break;
+        case 0x28: /* MSUB.S */
+            set_fpr_s(c, fd, (float)(fpr_s(c, fr) - fpr_s(c, fs) * fpr_s(c, ft)));
+            break;
+        case 0x2C: /* NMADD.S */
+            set_fpr_s(c, fd, (float)-(fpr_s(c, fr) + fpr_s(c, fs) * fpr_s(c, ft)));
+            break;
+        case 0x30: /* NMSUB.S */
+            set_fpr_s(c, fd, (float)-(fpr_s(c, fr) - fpr_s(c, fs) * fpr_s(c, ft)));
+            break;
+        case 0x21: /* MADD.D */
+            set_fpr_d(c, fd, fpr_d(c, fr) + fpr_d(c, fs) * fpr_d(c, ft));
+            break;
+        case 0x29: /* MSUB.D */
+            set_fpr_d(c, fd, fpr_d(c, fr) - fpr_d(c, fs) * fpr_d(c, ft));
+            break;
+        case 0x2D: /* NMADD.D */
+            set_fpr_d(c, fd, -(fpr_d(c, fr) + fpr_d(c, fs) * fpr_d(c, ft)));
+            break;
+        case 0x31: /* NMSUB.D */
+            set_fpr_d(c, fd, -(fpr_d(c, fr) - fpr_d(c, fs) * fpr_d(c, ft)));
+            break;
         default:
             break;
         }

@@ -40,7 +40,7 @@ struct Voodoo2EC {
     uint8_t* sgram;
     uint32_t sgram_mask;
 
-    uint32_t regs[256];
+    uint32_t regs[1024];
     uint32_t tmu_regs[2][V2_REG_TMU_COUNT];
 
     V2Cmdfifo cmdfifo;
@@ -399,13 +399,14 @@ uint32_t voodoo2ec_read(Voodoo2EC* v, uint32_t offset) {
     uint32_t region = offset >> 22;
     if (region == 0) {
         if (v2cmdfifo_enabled(&v->cmdfifo) && (offset & 0x200000)) return 0xFFFFFFFF;
-        return voodoo2ec_reg_read(v, (int)((offset >> 2) & 0xFF));
+        return voodoo2ec_reg_read(v, (int)((offset >> 2) & 0x3FF));
     }
     if (region == 1) return voodoo2ec_lfb_read(v, offset & 0x3FFFFF);
     return 0xFFFFFFFF;
 }
 
 void voodoo2ec_write(Voodoo2EC* v, uint32_t offset, uint32_t data, uint32_t mask) {
+    v->regs[253]++;
     uint32_t region = offset >> 22;
     if (region == 0) {
         if (v2cmdfifo_enabled(&v->cmdfifo) && (offset & 0x200000)) {
@@ -413,7 +414,7 @@ void voodoo2ec_write(Voodoo2EC* v, uint32_t offset, uint32_t data, uint32_t mask
             return;
         }
         int chip = chipmask_from_offset(offset >> 2);
-        v2_reg_write_chip(v, (int)((offset >> 2) & 0xFF), data, chip);
+        v2_reg_write_chip(v, (int)((offset >> 2) & 0x3FF), data, chip);
         (void)mask;
         return;
     }

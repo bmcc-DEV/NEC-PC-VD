@@ -148,6 +148,15 @@ static uint32_t fbits(float v) {
 
 static void write_ppm(const char* path, const uint32_t* rgb, int w, int h);
 
+/* Capture the Voodoo2 EC front buffer to a PPM (used to show what CPU
+ * firmware/demos rendered). */
+static void voodoo_capture(Voodoo2EC* v, const char* path) {
+    uint32_t rgb[640 * 480];
+    memset(rgb, 0, sizeof(rgb));
+    voodoo2ec_update(v, rgb, 640, 480);
+    write_ppm(path, rgb, 640, 480);
+}
+
 /* MMIO bridge: adapt the device API to the bus handler signatures */
 static uint32_t voodoo_mmio_read(void* ctx, uint64_t offset) {
     return voodoo2ec_read((Voodoo2EC*)ctx, (uint32_t)offset);
@@ -478,6 +487,10 @@ int main(int argc, char** argv) {
                                  : "(incomplete)");
 
     cpu_driven_validate(bus, audio, soc);
+
+    /* if a custom ROM was loaded, show what the CPU rendered on the Voodoo */
+    if (argc > 1)
+        voodoo_capture(voodoo, "cpu3d.ppm");
 
     voodoo_demo(voodoo);
     glide_demo(voodoo);
