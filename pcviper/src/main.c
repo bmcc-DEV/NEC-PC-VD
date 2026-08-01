@@ -267,6 +267,158 @@ static void a3d_demo(AurealA3D* a, Bus* bus) {
     free(mix);
 }
 
+/* ---- advanced Voodoo2 EC demo: Gouraud + fog, alpha blend,
+ *      multitexture (diffuse * lightmap), mipmap/trilinear ---- */
+
+static uint32_t v2_fbits(float v) {
+    uint32_t b;
+    memcpy(&b, &v, 4);
+    return b;
+}
+
+/* setup-engine triangle (firmware-style register path) */
+static void v2_tri(Voodoo2EC* v, uint32_t smode,
+                   float x0, float y0, float w0, uint32_t argb0, float s0, float t0,
+                   float x1, float y1, float w1, uint32_t argb1, float s1, float t1,
+                   float x2, float y2, float w2, uint32_t argb2, float s2, float t2) {
+    struct { float x, y, w; uint32_t argb; float s, t; } vt[3] = {
+        { x0, y0, w0, argb0, s0, t0 }, { x1, y1, w1, argb1, s1, t1 },
+        { x2, y2, w2, argb2, s2, t2 },
+    };
+    voodoo2ec_reg_write(v, V2_REG_SSETUPMODE, smode);
+    for (int i = 0; i < 3; i++) {
+        voodoo2ec_reg_write(v, V2_REG_SVX, v2_fbits(vt[i].x));
+        voodoo2ec_reg_write(v, V2_REG_SVY, v2_fbits(vt[i].y));
+        voodoo2ec_reg_write(v, V2_REG_SARGB, vt[i].argb);
+        voodoo2ec_reg_write(v, V2_REG_SWB, v2_fbits(1.0f));
+        voodoo2ec_reg_write(v, V2_REG_SWTMU0, v2_fbits(vt[i].w));
+        voodoo2ec_reg_write(v, V2_REG_SS_W0, v2_fbits(vt[i].s));
+        voodoo2ec_reg_write(v, V2_REG_ST_W0, v2_fbits(vt[i].t));
+        voodoo2ec_reg_write(v, V2_REG_SWTMU1, v2_fbits(vt[i].w));
+        voodoo2ec_reg_write(v, V2_REG_SS_W1, v2_fbits(vt[i].s));
+        voodoo2ec_reg_write(v, V2_REG_ST_W1, v2_fbits(vt[i].t));
+        voodoo2ec_reg_write(v, i ? V2_REG_SDRAWTRI : V2_REG_SBEGINTRI, 1);
+    }
+}
+
+static void v2_quad(Voodoo2EC* v, uint32_t smode,
+                    float x0, float y0, float w0, uint32_t argb0, float s0, float t0,
+                    float x1, float y1, float w1, uint32_t argb1, float s1, float t1,
+                    float x2, float y2, float w2, uint32_t argb2, float s2, float t2,
+                    float x3, float y3, float w3, uint32_t argb3, float s3, float t3) {
+    v2_tri(v, smode, x0, y0, w0, argb0, s0, t0, x1, y1, w1, argb1, s1, t1,
+           x2, y2, w2, argb2, s2, t2);
+    v2_tri(v, smode, x0, y0, w0, argb0, s0, t0, x2, y2, w2, argb2, s2, t2,
+           x3, y3, w3, argb3, s3, t3);
+}
+
+#define V2_TEX_PORT 0x800000u
+
+static void v2_upload_rgb565(Voodoo2EC* v, uint32_t sgram_off,
+                             uint32_t size, uint16_t color) {
+    for (uint32_t i = 0; i < size * size; i += 2) {
+        uint32_t dword = color | ((uint32_t)color << 16);
+        voodoo2ec_write(v, V2_TEX_PORT + sgram_off + i * 2, dword, ~0u);
+    }
+}
+
+static void voodoo_advanced_demo(Voodoo2EC* v) {
+    voodoo2ec_reset(v);
+    voodoo2ec_reg_write(v, V2_REG_FBIINIT1, 0x0128u);
+    uint32_t rgb[640 * 480];
+    const uint32_t SM_TEX0 = 0x31u, SM_TEX01 = 0xB1u, SM_PLAIN = 0x11u;
+
+    /* ---- fog table: linear ramp 0..255 ---- */
+    for (int i = 0; i < 64; i++) {
+        uint32_t d = (uint32_t)(i * 4) | ((uint32_t)(i * 4 + 1) << 8)
+                   | ((uint32_t)(i * 4 + 2) << 16) | ((uint32_t)(i * 4 + 3) << 24);
+        voodoo2ec_reg_write(v, V2_REG_FOGTABLE, d);
+    }
+
+    /* 1. Gouraud + distance fog (top-left): red near -> blue far, fogged
+     *    to white at the far edge via the fogTable. */
+    voodoo2ec_reg_write(v, V2_REG_FOGMODE, 0x41u);      /* enable + table */
+    voodoo2ec_reg_write(v, V2_REG_FOGCOLOR, 0x00FFFFFFu);
+    v2_quad(v, SM_PLAIN,
+            20, 20, 1.0f, 0xFFFF0000u, 0, 0,
+            300, 20, 1.0f, 0xFFFF0000u, 0, 0,
+            300, 220, 0.02f, 0xFF0000FFu, 0, 0,
+            20, 220, 0.02f, 0xFF0000FFu, 0, 0);
+
+    /* 2. Alpha blend (top-right): opaque red + 50% blue on top. */
+    voodoo2ec_reg_write(v, V2_REG_FOGMODE, 0u);
+    voodoo2ec_reg_write(v, V2_REG_FBZCOLORPATH, 0u);
+    v2_quad(v, SM_PLAIN,
+            340, 20, 1.0f, 0xFFFF0000u, 0, 0,
+            620, 20, 1.0f, 0xFFFF0000u, 0, 0,
+            620, 220, 1.0f, 0xFFFF0000u, 0, 0,
+            340, 220, 1.0f, 0xFFFF0000u, 0, 0);
+    voodoo2ec_reg_write(v, V2_REG_ALPHAMODE,
+                        (2u << 0) | (1u << 3) | (0u << 6) | (0u << 10));
+    v2_quad(v, SM_PLAIN,
+            340, 20, 1.0f, 0x800000FFu, 0, 0,
+            620, 20, 1.0f, 0x800000FFu, 0, 0,
+            620, 220, 1.0f, 0x800000FFu, 0, 0,
+            340, 220, 1.0f, 0x800000FFu, 0, 0);
+    voodoo2ec_reg_write(v, V2_REG_ALPHAMODE, 0u);
+
+    /* 3. Multitexture (bottom-left): TMU0 16x16 checkerboard diffuse *
+     *    TMU1 red lightmap (single pass, TMU0+TMU1). */
+    for (int t = 0; t < 16; t++)
+        for (int s = 0; s < 16; s += 2) {
+            uint16_t c0 = (((s >> 1) + (t >> 1)) & 1) ? 0xFFFFu : 0x0000u;
+            uint16_t c1 = ((((s + 1) >> 1) + (t >> 1)) & 1) ? 0xFFFFu : 0x0000u;
+            voodoo2ec_write(v, V2_TEX_PORT + 0x300000u + (uint32_t)(t * 16 + s) * 2,
+                            c0 | ((uint32_t)c1 << 16), ~0u);
+        }
+    v2_upload_rgb565(v, 0x340000u, 16, 0xF800u);        /* red lightmap */
+    voodoo2ec_write(v, (uint32_t)((V2_REG_TEXTUREMODE << 2) | (1u << 12)), 0x10, ~0u);
+    voodoo2ec_write(v, (uint32_t)((V2_REG_TLOD << 2) | (1u << 12)), 4 << 3, ~0u);
+    voodoo2ec_write(v, (uint32_t)((V2_REG_TEXBASEADDR << 2) | (1u << 12)), 0x300000u, ~0u);
+    voodoo2ec_write(v, (uint32_t)((V2_REG_TEXTUREMODE << 2) | (2u << 12)), 0x10, ~0u);
+    voodoo2ec_write(v, (uint32_t)((V2_REG_TLOD << 2) | (2u << 12)), 4 << 3, ~0u);
+    voodoo2ec_write(v, (uint32_t)((V2_REG_TEXBASEADDR << 2) | (2u << 12)), 0x340000u, ~0u);
+    v2_quad(v, SM_TEX01,
+            20, 260, 1.0f, 0xFFFFFFFFu, 0, 0,
+            300, 260, 1.0f, 0xFFFFFFFFu, 16, 0,
+            300, 460, 1.0f, 0xFFFFFFFFu, 16, 16,
+            20, 460, 1.0f, 0xFFFFFFFFu, 0, 16);
+
+    /* 4. Mipmap + trilinear (bottom-right): 64x64 red + 32x32 green,
+     *    LOD ~5.4 across the quad blends the two levels. */
+    v2_upload_rgb565(v, 0x200000u, 64, 0xF800u);
+    v2_upload_rgb565(v, 0x200000u + 64u * 64u * 2u, 32, 0x07E0u);
+    voodoo2ec_write(v, (uint32_t)((V2_REG_TEXTUREMODE << 2) | (1u << 12)), 0x10, ~0u);
+    voodoo2ec_write(v, (uint32_t)((V2_REG_TLOD << 2) | (1u << 12)), (6 << 3) | (5 << 8), ~0u);
+    voodoo2ec_write(v, (uint32_t)((V2_REG_TEXBASEADDR << 2) | (1u << 12)), 0x200000u, ~0u);
+    voodoo2ec_write(v, (uint32_t)((V2_REG_TREXINIT0 << 2) | (1u << 12)), 0x03u, ~0u);
+    v2_quad(v, SM_TEX0,
+            340, 260, 1.0f, 0xFFFFFFFFu, 0, 0,
+            620, 260, 1.0f, 0xFFFFFFFFu, 200, 0,
+            620, 460, 1.0f, 0xFFFFFFFFu, 200, 64,
+            340, 460, 1.0f, 0xFFFFFFFFu, 0, 64);
+
+    voodoo2ec_reg_write(v, V2_REG_SWAPBUFFERCMD, 0);
+    voodoo2ec_update(v, rgb, 640, 480);
+
+    uint32_t fog_near = rgb[40 + 40 * 640], fog_far = rgb[40 + 200 * 640];
+    uint32_t blend = rgb[480 + 120 * 640];
+    uint32_t mtex_w = rgb[64 + 310 * 640], mtex_b = rgb[29 + 310 * 640];
+    uint32_t mip = rgb[480 + 360 * 640];
+
+    int ok = 1;
+    ok = ok && ((fog_near >> 16) & 0xFF) > 200;                  /* red near */
+    ok = ok && (fog_far & 0xFF) > 200 && ((fog_far >> 8) & 0xFF) > 200;
+    ok = ok && (((blend >> 16) & 0xFF) > 90 && ((blend >> 16) & 0xFF) < 170);
+    ok = ok && ((mtex_w >> 16) & 0xFF) > 200 && (mtex_b & 0xFF) < 40;
+    ok = ok && (((mip >> 8) & 0xFF) > 60 && ((mip >> 16) & 0xFF) > 60);
+    printf("pcviper: advanced demo fog=%08X/%08X blend=%08X mtex=%08X/%08X mip=%08X\n",
+           fog_near, fog_far, blend, mtex_w, mtex_b, mip);
+    printf("pcviper: %s\n", ok ? "gouraud+fog / alpha / multitex / mipmap OK"
+                               : "advanced demo: unexpected output");
+    write_ppm("advanced.ppm", rgb, 640, 480);
+}
+
 static void glide_demo(Voodoo2EC* voodoo) {
     GrContext ctx;
     ctx.voodoo = voodoo;
@@ -755,6 +907,7 @@ int main(int argc, char** argv) {
 
     voodoo_demo(voodoo);
     glide_demo(voodoo);
+    voodoo_advanced_demo(voodoo);
     soc_demo(soc, bus);
     a3d_demo(audio, bus);
 

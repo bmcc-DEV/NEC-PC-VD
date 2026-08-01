@@ -15,7 +15,7 @@ echo "[2/4] Unit test suites"
 make build-tests >/dev/null 2>&1 || { echo "  test build failed"; exit 1; }
 total_pass=0
 total_fail=0
-for t in cpu voodoo aureal viper glide pipeline; do
+for t in cpu voodoo aureal viper glide pipeline voodoo_adv; do
     res=$(./build/${t}_test 2>&1)
     pass=$(echo "$res" | grep -c "^PASS" || true)
     fail=$(echo "$res" | grep -c "^FAIL" || true)
@@ -133,6 +133,7 @@ check_wav() {
 ok=1
 check_ppm voodoo.ppm || ok=0
 check_ppm glide.ppm || ok=0
+check_ppm advanced.ppm || ok=0
 check_wav aureal.wav || ok=0
 [ "$ok" -eq 1 ] || { echo "ARTIFACTS: FAILED"; exit 1; }
 

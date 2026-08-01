@@ -61,6 +61,11 @@ struct Voodoo2EC {
     bool clut_dirty;
     uint32_t pen[65536];
 
+    /* 256-entry fog table (Voodoo2: written sequentially through the
+     * FOGTABLE register, 4 entries per 32-bit write) */
+    uint8_t fogtable[256];
+    int fogtable_wpos;
+
     uint32_t init_enable;
     bool vblank;
 };
@@ -233,6 +238,8 @@ void voodoo2ec_reset(Voodoo2EC* v) {
     v->xoffs = v->yoffs = 0;
     v->init_enable = 0;
     v->vblank = false;
+    memset(v->fogtable, 0, sizeof(v->fogtable));
+    v->fogtable_wpos = 0;
 
     /* Display configuration defaults (x tiles = 20 * 32 = 640) */
     v->regs[V2_REG_FBIINIT1] = (20u << 1) | (1u << 8) | FBIINIT1_BLANK;
@@ -298,6 +305,16 @@ void voodoo2ec_reg_write(Voodoo2EC* v, int regnum, uint32_t data) {
 
 static void v2_reg_write_chip(Voodoo2EC* v, int regnum, uint32_t data, int chipmask) {
     if (regnum < 0 || regnum >= 256) return;
+
+    /* FOGTABLE: 4 entries per write, sequential pointer (the 256-byte
+     * table would otherwise collide with the register file) */
+    if (regnum == V2_REG_FOGTABLE) {
+        for (int i = 0; i < 4; i++) {
+            v->fogtable[v->fogtable_wpos] = (uint8_t)(data >> (i * 8));
+            v->fogtable_wpos = (v->fogtable_wpos + 1) & 0xFF;
+        }
+        return;
+    }
 
     if (regnum >= V2_REG_TMU_BASE) {
         int idx = regnum - V2_REG_TMU_BASE;
@@ -680,6 +697,93 @@ void voodoo2ec_triangle_legacy(Voodoo2EC* v) {
     voodoo2ec_rasterize(v, &v0, &v1, &v2, false, false);
 }
 
+/* ------------------------------------------------------------------ */
+/* advanced shading helpers: fog, alpha blend, mipmap/trilinear LOD    */
+/*                                                                     */
+/* Fog depth d = clamp(1 - w, 0, 1) with w the perspective-correct     */
+/* interpolated 1/z (d = 0 near the camera, d = 1 at infinity).        */
+/*   linear mode:   f = d                                              */
+/*   table mode:    f = fogTable[clamp8(d*255)] / 255                  */
+/*   result = color * (1-f) + fogColor * f                             */
+/*                                                                     */
+/* Alpha blend (alphaMode): blend when aRGBMode == 2; alpha source:    */
+/*   0 = constant (color1 bits 31:24), 1 = interpolated vertex alpha,  */
+/*   2/3 = TMU0/TMU1 texel alpha, 4 = one. acblendop 0 = accum         */
+/*   (src*a + dst*(1-a)), 1 = reverse; acblend 0 = add, 1 = subtract.  */
+/*                                                                     */
+/* Mipmaps: TLOD lodmin/lodmax fields, tRexInit0 bit 0 = mipmap,       */
+/*   bit 1 = trilinear. LOD from texture-coordinate derivatives.       */
+/* ------------------------------------------------------------------ */
+
+static void v2_bary_all(double px, double py, double x0, double y0,
+                        double x1, double y1, double x2, double y2,
+                        double area, double* w) {
+    w[0] = ((x1 - px) * (y2 - py) - (y1 - py) * (x2 - px)) / area;
+    w[1] = ((x2 - px) * (y0 - py) - (y2 - py) * (x0 - px)) / area;
+    w[2] = ((x0 - px) * (y1 - py) - (y0 - py) * (x1 - px)) / area;
+}
+
+static double v2_sw(double s0, double s1, double s2, double w0, double w1,
+                    double w2, const double* b) {
+    return s0 * w0 * b[0] + s1 * w1 * b[1] + s2 * w2 * b[2];
+}
+
+static double v2_ww(double w0, double w1, double w2, const double* b) {
+    return w0 * b[0] + w1 * b[1] + w2 * b[2];
+}
+
+/* floating-point LOD (chan 0 = TMU0, 1 = TMU1) from pixel+neighbour
+ * finite differences of the perspective-corrected texture coordinates */
+static double v2_tex_lod(const V2SetupVertex* v0, const V2SetupVertex* v1,
+                         const V2SetupVertex* v2, int chan, int lodmin,
+                         double px, double py, double s, double t,
+                         double x0, double y0, double x1, double y1,
+                         double x2, double y2, double area) {
+    double bx[3], by[3];
+    v2_bary_all(px + 1, py, x0, y0, x1, y1, x2, y2, area, bx);
+    v2_bary_all(px, py + 1, x0, y0, x1, y1, x2, y2, area, by);
+    double s0, s1, s2, t0, t1, t2;
+    if (chan == 0) {
+        s0 = v0->s0; s1 = v1->s0; s2 = v2->s0;
+        t0 = v0->t0; t1 = v1->t0; t2 = v2->t0;
+    } else {
+        s0 = v0->s1; s1 = v1->s1; s2 = v2->s1;
+        t0 = v0->t1; t1 = v1->t1; t2 = v2->t1;
+    }
+    double w0v = v0->w0, w1v = v1->w0, w2v = v2->w0;
+    double sx = v2_sw(s0, s1, s2, w0v, w1v, w2v, bx) / v2_ww(w0v, w1v, w2v, bx);
+    double sy = v2_sw(s0, s1, s2, w0v, w1v, w2v, by) / v2_ww(w0v, w1v, w2v, by);
+    double tx = v2_sw(t0, t1, t2, w0v, w1v, w2v, bx) / v2_ww(w0v, w1v, w2v, bx);
+    double ty = v2_sw(t0, t1, t2, w0v, w1v, w2v, by) / v2_ww(w0v, w1v, w2v, by);
+    double m = fmax(fabs(sx - s), fmax(fabs(sy - s), fmax(fabs(tx - t), fabs(ty - t))));
+    if (m <= 0.0) return (double)lodmin;
+    double lod = log2(m * (double)(1 << lodmin));
+    if (lod < 0) lod = 0;
+    return lod;
+}
+
+/* address of mip level `lod` within a chain whose largest level is lodmin */
+static uint32_t v2_mip_offset(uint32_t fmt, int lodmin, int lod) {
+    uint32_t bpp = (fmt <= 3) ? 1 : ((fmt == 4 || fmt == 5 || fmt == 7) ? 2 : 4);
+    uint32_t off = 0;
+    for (int k = lod + 1; k <= lodmin; k++)
+        off += (1u << (2 * k)) * bpp;
+    return off;
+}
+
+static uint32_t v2_sample_mip(const Voodoo2EC* v, uint32_t fmt, int lodmin,
+                              int lod, uint32_t s, uint32_t t, uint32_t texbase) {
+    uint32_t off = v2_mip_offset(fmt, lodmin, lod);
+    return sample_texel(v, fmt, lod, s, t,
+                        (texbase + off) & v->sgram_mask);
+}
+
+static uint8_t v2_fog_byte(const Voodoo2EC* v, int idx) {
+    if (idx < 0) idx = 0;
+    if (idx > 255) idx = 255;
+    return v->fogtable[idx];
+}
+
 void voodoo2ec_rasterize(Voodoo2EC* v, const V2SetupVertex* v0in,
                          const V2SetupVertex* v1in, const V2SetupVertex* v2in,
                          bool use_tex0, bool use_tex1) {
@@ -701,12 +805,36 @@ void voodoo2ec_rasterize(Voodoo2EC* v, const V2SetupVertex* v0in,
     uint32_t texmode1 = v->tmu_regs[1][V2_REG_TEXTUREMODE - V2_REG_TMU_BASE];
     uint32_t tlod0 = v->tmu_regs[0][V2_REG_TLOD - V2_REG_TMU_BASE];
     uint32_t tlod1 = v->tmu_regs[1][V2_REG_TLOD - V2_REG_TMU_BASE];
+    uint32_t trex0 = v->tmu_regs[0][V2_REG_TREXINIT0 - V2_REG_TMU_BASE];
+    uint32_t trex1 = v->tmu_regs[1][V2_REG_TREXINIT0 - V2_REG_TMU_BASE];
     uint32_t tbase0 = v->tmu_regs[0][V2_REG_TEXBASEADDR - V2_REG_TMU_BASE] & 0xFFFFFF;
     uint32_t tbase1 = v->tmu_regs[1][V2_REG_TEXBASEADDR - V2_REG_TMU_BASE] & 0xFFFFFF;
     uint32_t fmt0 = use_tex0 ? ((texmode0 >> 2) & 7) : 0;
     uint32_t fmt1 = use_tex1 ? ((texmode1 >> 2) & 7) : 0;
-    int lod0 = use_tex0 ? (int)((tlod0 >> 3) & 0x1F) : 0;
-    int lod1 = use_tex1 ? (int)((tlod1 >> 3) & 0x1F) : 0;
+    int lodmin0 = use_tex0 ? (int)((tlod0 >> 3) & 0x1F) : 0;
+    int lodmin1 = use_tex1 ? (int)((tlod1 >> 3) & 0x1F) : 0;
+    bool mip0 = use_tex0 && (trex0 & 1u) != 0;
+    bool mip1 = use_tex1 && (trex1 & 1u) != 0;
+    bool tri0 = use_tex0 && (trex0 & 2u) != 0;
+    bool tri1 = use_tex1 && (trex1 & 2u) != 0;
+    int lodmax0 = mip0 ? (int)((tlod0 >> 8) & 0x1F) : lodmin0;
+    int lodmax1 = mip1 ? (int)((tlod1 >> 8) & 0x1F) : lodmin1;
+
+    /* fog configuration (fogMode, fogColor, fogTable) */
+    uint32_t fogmode = v->regs[V2_REG_FOGMODE];
+    bool fog_en = (fogmode & 1u) != 0;
+    bool fog_table = (fogmode & (1u << 6)) != 0;
+    int fogr = (int)((v->regs[V2_REG_FOGCOLOR] >> 16) & 0xFF);
+    int fogg = (int)((v->regs[V2_REG_FOGCOLOR] >> 8) & 0xFF);
+    int fogb = (int)(v->regs[V2_REG_FOGCOLOR] & 0xFF);
+
+    /* alpha blending configuration (alphaMode) */
+    uint32_t amode = v->regs[V2_REG_ALPHAMODE];
+    bool blend = ((amode >> 0) & 7) == 2;
+    int asrc = (int)((amode >> 3) & 7);
+    int abop = (int)((amode >> 10) & 3);
+    int abfunc = (int)((amode >> 6) & 3);
+    int const_a = (int)((v->regs[V2_REG_COLOR1] >> 24) & 0xFF);
 
     int minx = v2_max(0, (int)v2_min(x0, v2_min(x1, x2)));
     int maxx = v2_min(v->rowpixels - 1, (int)v2_max(x0, v2_max(x1, x2)));
@@ -730,47 +858,155 @@ void voodoo2ec_rasterize(Voodoo2EC* v, const V2SetupVertex* v0in,
         double py = y + 0.5;
         for (int x = minx; x <= maxx; x++) {
             double px = x + 0.5;
-            double w0 = ((x1 - px) * (y2 - py) - (y1 - py) * (x2 - px)) / area;
-            double w1 = ((x2 - px) * (y0 - py) - (y2 - py) * (x0 - px)) / area;
-            double w2 = ((x0 - px) * (y1 - py) - (y0 - py) * (x1 - px)) / area;
-            if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0) continue;
+            double bw[3];
+            v2_bary_all(px, py, x0, y0, x1, y1, x2, y2, area, bw);
+            if (bw[0] < 0.0 || bw[1] < 0.0 || bw[2] < 0.0) continue;
+
 
             int r, g, b;
             if (constant_rgb) {
                 uint32_t col = v->regs[V2_REG_COLOR1];
                 r = (col >> 16) & 0xFF; g = (col >> 8) & 0xFF; b = col & 0xFF;
             } else {
-                r = clamp8((int)(v0in->r * w0 + v1in->r * w1 + v2in->r * w2));
-                g = clamp8((int)(v0in->g * w0 + v1in->g * w1 + v2in->g * w2));
-                b = clamp8((int)(v0in->b * w0 + v1in->b * w1 + v2in->b * w2));
+                r = clamp8((int)(v0in->r * bw[0] + v1in->r * bw[1] + v2in->r * bw[2]));
+                g = clamp8((int)(v0in->g * bw[0] + v1in->g * bw[1] + v2in->g * bw[2]));
+                b = clamp8((int)(v0in->b * bw[0] + v1in->b * bw[1] + v2in->b * bw[2]));
             }
+            int va = clamp8((int)(v0in->a * bw[0] + v1in->a * bw[1] + v2in->a * bw[2]));
 
-            uint32_t col = 0xFF000000u | (r << 16) | (g << 8) | b;
+            uint32_t col = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+            int tex0a = 255, tex1a = 255;
+
+            /* perspective-correct w (1/z): texture correction, fog depth,
+             * mipmap LOD */
+            double ww = v2_ww(v0in->w0, v1in->w0, v2in->w0, bw);
 
             if (use_tex0) {
-                double sw = v0in->s0 * v0in->w0 * w0 + v1in->s0 * v1in->w0 * w1 +
-                            v2in->s0 * v2in->w0 * w2;
-                double tw = v0in->t0 * v0in->w0 * w0 + v1in->t0 * v1in->w0 * w1 +
-                            v2in->t0 * v2in->w0 * w2;
-                double ww = v0in->w0 * w0 + v1in->w0 * w1 + v2in->w0 * w2;
-                if (ww > 1e-6)
-                    col = sample_texel(v, fmt0, lod0, (uint32_t)(sw / ww),
-                                       (uint32_t)(tw / ww), tbase0);
+                double sw = v2_sw(v0in->s0, v1in->s0, v2in->s0,
+                                  v0in->w0, v1in->w0, v2in->w0, bw);
+                double tw = v2_sw(v0in->t0, v1in->t0, v2in->t0,
+                                  v0in->w0, v1in->w0, v2in->w0, bw);
+                if (ww > 1e-6) {
+                    uint32_t s = (uint32_t)(sw / ww);
+                    uint32_t t = (uint32_t)(tw / ww);
+                    if (mip0) {
+                        double lodf = v2_tex_lod(v0in, v1in, v2in, 0, lodmin0,
+                                                 px, py, sw / ww, tw / ww,
+                                                 x0, y0, x1, y1, x2, y2, area);
+                        if (lodf < (double)lodmax0) lodf = (double)lodmax0;
+                        if (lodf > (double)lodmin0) lodf = (double)lodmin0;
+                        int level = (int)lodf;
+                        double frac = lodf - level;
+                        uint32_t c0 = v2_sample_mip(v, fmt0, lodmin0, level, s, t, tbase0);
+                        if (tri0 && level + 1 <= lodmin0) {
+                            uint32_t c1c = v2_sample_mip(v, fmt0, lodmin0, level + 1, s, t, tbase0);
+                            int a0 = (int)((c0 >> 24) & 0xFF);
+                            int a1 = (int)((c1c >> 24) & 0xFF);
+                            int cr = (int)(((c0 >> 16) & 0xFF) * (1.0 - frac) +
+                                           ((c1c >> 16) & 0xFF) * frac);
+                            int cg = (int)(((c0 >> 8) & 0xFF) * (1.0 - frac) +
+                                           ((c1c >> 8) & 0xFF) * frac);
+                            int cb = (int)((c0 & 0xFF) * (1.0 - frac) +
+                                           (c1c & 0xFF) * frac);
+                            int ca = (int)(a0 * (1.0 - frac) + a1 * frac);
+                            c0 = ((uint32_t)clamp8(ca) << 24) | ((uint32_t)clamp8(cr) << 16)
+                               | ((uint32_t)clamp8(cg) << 8) | clamp8(cb);
+                        }
+                        tex0a = (int)((c0 >> 24) & 0xFF);
+                        col = c0;
+                    } else {
+                        col = sample_texel(v, fmt0, lodmin0, s, t, tbase0);
+                        tex0a = (int)((col >> 24) & 0xFF);
+                    }
+                }
             }
             if (use_tex1) {
-                double sw = v0in->s1 * v0in->w1 * w0 + v1in->s1 * v1in->w1 * w1 +
-                            v2in->s1 * v2in->w1 * w2;
-                double tw = v0in->t1 * v0in->w1 * w0 + v1in->t1 * v1in->w1 * w1 +
-                            v2in->t1 * v2in->w1 * w2;
-                double ww = v0in->w1 * w0 + v1in->w1 * w1 + v2in->w1 * w2;
+                double sw = v2_sw(v0in->s1, v1in->s1, v2in->s1,
+                                  v0in->w0, v1in->w0, v2in->w0, bw);
+                double tw = v2_sw(v0in->t1, v1in->t1, v2in->t1,
+                                  v0in->w0, v1in->w0, v2in->w0, bw);
                 if (ww > 1e-6) {
-                    uint32_t tex1 = sample_texel(v, fmt1, lod1, (uint32_t)(sw / ww),
-                                                 (uint32_t)(tw / ww), tbase1);
-                    int cr2 = ((col >> 16) & 0xFF) * ((tex1 >> 16) & 0xFF) / 255;
-                    int cg2 = ((col >> 8) & 0xFF) * ((tex1 >> 8) & 0xFF) / 255;
-                    int cb2 = (col & 0xFF) * (tex1 & 0xFF) / 255;
-                    col = 0xFF000000u | (cr2 << 16) | (cg2 << 8) | cb2;
+                    uint32_t s = (uint32_t)(sw / ww);
+                    uint32_t t = (uint32_t)(tw / ww);
+                    uint32_t tc;
+                    if (mip1) {
+                        double lodf = v2_tex_lod(v0in, v1in, v2in, 1, lodmin1,
+                                                 px, py, sw / ww, tw / ww,
+                                                 x0, y0, x1, y1, x2, y2, area);
+                        if (lodf < (double)lodmax1) lodf = (double)lodmax1;
+                        if (lodf > (double)lodmin1) lodf = (double)lodmin1;
+                        int level = (int)lodf;
+                        double frac = lodf - level;
+                        tc = v2_sample_mip(v, fmt1, lodmin1, level, s, t, tbase1);
+                        if (tri1 && level + 1 <= lodmin1) {
+                            uint32_t c1c = v2_sample_mip(v, fmt1, lodmin1, level + 1, s, t, tbase1);
+                            int a0 = (int)((tc >> 24) & 0xFF);
+                            int a1 = (int)((c1c >> 24) & 0xFF);
+                            int cr = (int)(((tc >> 16) & 0xFF) * (1.0 - frac) +
+                                           ((c1c >> 16) & 0xFF) * frac);
+                            int cg = (int)(((tc >> 8) & 0xFF) * (1.0 - frac) +
+                                           ((c1c >> 8) & 0xFF) * frac);
+                            int cb = (int)((tc & 0xFF) * (1.0 - frac) +
+                                           (c1c & 0xFF) * frac);
+                            int ca = (int)(a0 * (1.0 - frac) + a1 * frac);
+                            tc = ((uint32_t)clamp8(ca) << 24) | ((uint32_t)clamp8(cr) << 16)
+                               | ((uint32_t)clamp8(cg) << 8) | clamp8(cb);
+                        }
+                    } else {
+                        tc = sample_texel(v, fmt1, lodmin1, s, t, tbase1);
+                    }
+                    tex1a = (int)((tc >> 24) & 0xFF);
+                    int cr2 = ((col >> 16) & 0xFF) * ((tc >> 16) & 0xFF) / 255;
+                    int cg2 = ((col >> 8) & 0xFF) * ((tc >> 8) & 0xFF) / 255;
+                    int cb2 = (col & 0xFF) * (tc & 0xFF) / 255;
+                    col = 0xFF000000u | ((uint32_t)cr2 << 16) | ((uint32_t)cg2 << 8) | cb2;
                 }
+            }
+
+            /* distance fog (fogTable or linear) */
+            if (fog_en) {
+                double d = 1.0 - ww;
+                if (d < 0.0) d = 0.0;
+                if (d > 1.0) d = 1.0;
+                double f = fog_table ? v2_fog_byte(v, clamp8((int)(d * 255.0))) / 255.0 : d;
+                int cr = (int)(((col >> 16) & 0xFF) * (1.0 - f) + fogr * f);
+                int cg = (int)(((col >> 8) & 0xFF) * (1.0 - f) + fogg * f);
+                int cb = (int)((col & 0xFF) * (1.0 - f) + fogb * f);
+                col = 0xFF000000u | ((uint32_t)clamp8(cr) << 16)
+                    | ((uint32_t)clamp8(cg) << 8) | clamp8(cb);
+            }
+
+            /* alpha blend with the existing back buffer pixel */
+            if (blend) {
+                int a8;
+                switch (asrc) {
+                case 0: a8 = const_a; break;
+                case 1: a8 = va; break;
+                case 2: a8 = tex0a; break;
+                case 3: a8 = tex1a; break;
+                default: a8 = 255; break;
+                }
+                uint16_t dst = row[x];
+                int dr = (dst >> 11) & 0x1F; dr = (dr << 3) | (dr >> 2);
+                int dg = (dst >> 5) & 0x3F;  dg = (dg << 2) | (dg >> 4);
+                int db = dst & 0x1F;         db = (db << 3) | (db >> 2);
+                int cr = (col >> 16) & 0xFF, cg = (col >> 8) & 0xFF, cb = col & 0xFF;
+                double sa = a8 / 255.0, inva = 1.0 - sa;
+                int nr, ng, nb;
+                if (abfunc == 1) {   /* subtract */
+                    nr = clamp8((int)(dr - cr * sa));
+                    ng = clamp8((int)(dg - cg * sa));
+                    nb = clamp8((int)(db - cb * sa));
+                } else {             /* add */
+                    nr = (abop == 1) ? (int)(cr * inva + dr * sa)
+                                     : (int)(cr * sa + dr * inva);
+                    ng = (abop == 1) ? (int)(cg * inva + dg * sa)
+                                     : (int)(cg * sa + dg * inva);
+                    nb = (abop == 1) ? (int)(cb * inva + db * sa)
+                                     : (int)(cb * sa + db * inva);
+                }
+                col = 0xFF000000u | ((uint32_t)clamp8(nr) << 16)
+                    | ((uint32_t)clamp8(ng) << 8) | clamp8(nb);
             }
 
             row[x] = is555 ? pack555((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF)

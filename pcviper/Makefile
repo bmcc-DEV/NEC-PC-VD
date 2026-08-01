@@ -47,6 +47,8 @@ build-tests: $(BIN)
 		src/glide_api.c src/voodoo2_ec.c src/voodoo_fifo.c src/bus.c -lm
 	$(CC) $(CFLAGS) -o $(BUILD)/pipeline_test tests/pipeline_test.c \
 		src/vr5432.c src/bus.c -lm
+	$(CC) $(CFLAGS) -o $(BUILD)/voodoo_adv_test tests/voodoo_adv_test.c \
+		src/voodoo2_ec.c src/voodoo_fifo.c -lm
 
 tests: build-tests
 	./$(BUILD)/cpu_test
@@ -55,6 +57,7 @@ tests: build-tests
 	./$(BUILD)/viper_test
 	./$(BUILD)/glide_test
 	./$(BUILD)/pipeline_test
+	./$(BUILD)/voodoo_adv_test
 	./$(BIN)
 
 firmware/demo3d.bin: firmware/demo3d.c firmware/init.S firmware/link.ld
