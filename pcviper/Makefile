@@ -18,7 +18,11 @@ SRCS = src/main.c src/vr5432.c src/bus.c src/voodoo2_ec.c src/voodoo_fifo.c \
        src/aureal_a3d.c src/viper_system.c src/glide_api.c
 OBJS = $(SRCS:src/%.c=$(BUILD)/%.o)
 
-.PHONY: all tests clean
+# MIPS IV cross-toolchain for the firmware/demos
+MIPS_CC  := $(shell command -v mips64-elf-gcc 2>/dev/null || echo /opt/libdragon/bin/mips64-elf-gcc)
+MIPS_OBJ := $(shell command -v mips64-elf-objcopy 2>/dev/null || echo /opt/libdragon/bin/mips64-elf-objcopy)
+
+.PHONY: all tests demo3d demo3d-headless clean
 
 all: $(BIN)
 
@@ -52,6 +56,19 @@ tests: build-tests
 	./$(BUILD)/glide_test
 	./$(BUILD)/pipeline_test
 	./$(BIN)
+
+firmware/demo3d.bin: firmware/demo3d.c firmware/init.S firmware/link.ld
+	$(MIPS_CC) -EL -mips4 -mhard-float -ffreestanding -nostdlib \
+		-mno-abicalls -G0 -O2 -T firmware/link.ld \
+		-o firmware/demo3d.elf firmware/init.S firmware/demo3d.c
+	$(MIPS_OBJ) -O binary firmware/demo3d.elf firmware/demo3d.bin
+
+demo3d: all firmware/demo3d.bin
+	./$(BIN) firmware/demo3d.bin --sdl
+
+demo3d-headless: all firmware/demo3d.bin
+	PCVIPER_SDL_FRAMES=4 SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+		./$(BIN) firmware/demo3d.bin --sdl
 
 clean:
 	rm -rf $(BUILD) $(BIN)

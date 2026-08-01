@@ -3,7 +3,8 @@
  *
  * Boota o núcleo MIPS, acessa o Voodoo2 EC (100 MHz, 16 MB SGRAM unificada)
  * via MMIO do barramento e renderiza um triângulo multitexturizado num
- * arquivo PPM de saída.
+ * arquivo PPM de saída. Com SDL2 e a flag --sdl, roda o firmware demo3d em
+ * tempo real numa janela, com rotação/movimento/zoom via teclado ou gamepad.
  */
 #include "bus.h"
 #include "vr5432.h"
@@ -430,6 +431,219 @@ static void voodoo_demo(Voodoo2EC* v) {
     write_ppm("voodoo.ppm", rgb, 640, 480);
 }
 
+/* ---- host/firmware input block ----
+ * Shared with firmware/demo3d.c at physical 0x00000800. The host streams
+ * cos/sin of the rotation angles, camera distance and translation; the
+ * firmware still does the full FPU geometry. */
+#define VIPER_INPUT_ADDR      0x00000800ull
+#define VIPER_INPUT_MAGIC     0xA3D2EC01u
+#define VIPER_SDL_FB_W        640
+#define VIPER_SDL_FB_H        480
+#define VIPER_SDL_CYCLES      50000   /* cycles per firmware frame (~43k) */
+
+typedef struct {
+    float cy, sy;      /* cos/sin of yaw */
+    float cx, sx;      /* cos/sin of pitch */
+    float camz;        /* camera distance (zoom) */
+    float tx, ty;      /* screen-space translation (pixels) */
+    uint32_t magic;
+} ViperInput;
+
+static void viper_input_write(Bus* bus, const ViperInput* in) {
+    const uint32_t* w = (const uint32_t*)in;
+    for (int i = 0; i < 8; i++)
+        bus_write32(bus, VIPER_INPUT_ADDR + (uint64_t)i * 4, w[i]);
+}
+
+/* Headless override: PCVIPER_INPUT_YAW/PITCH/CAMZ/TX/TY (env) writes the
+ * input block so non-interactive runs (and validate.sh) can exercise the
+ * same host->firmware path used by the SDL2 interactive demo. */
+static int viper_input_from_env(Bus* bus) {
+    const char* yaw = getenv("PCVIPER_INPUT_YAW");
+    const char* pitch = getenv("PCVIPER_INPUT_PITCH");
+    const char* camz = getenv("PCVIPER_INPUT_CAMZ");
+    const char* tx = getenv("PCVIPER_INPUT_TX");
+    const char* ty = getenv("PCVIPER_INPUT_TY");
+    if (!yaw && !pitch && !camz && !tx && !ty) return 0;
+    ViperInput in;
+    in.magic = VIPER_INPUT_MAGIC;
+    in.cy = 0.9396926f; in.sy = 0.3420201f;   /* default yaw 20 deg */
+    in.cx = 1.0f; in.sx = 0.0f;
+    in.camz = 3.0f; in.tx = 0.0f; in.ty = 0.0f;
+    if (yaw) {
+        in.cy = cosf(strtof(yaw, NULL) * M_PI / 180.0f);
+        in.sy = sinf(strtof(yaw, NULL) * M_PI / 180.0f);
+    }
+    if (pitch) {
+        in.cx = cosf(strtof(pitch, NULL) * M_PI / 180.0f);
+        in.sx = sinf(strtof(pitch, NULL) * M_PI / 180.0f);
+    }
+    if (camz) in.camz = strtof(camz, NULL);
+    if (tx) in.tx = strtof(tx, NULL);
+    if (ty) in.ty = strtof(ty, NULL);
+    viper_input_write(bus, &in);
+    return 1;
+}
+
+#ifdef HAVE_SDL2
+static int interactive_demo(Bus* bus, Vr5432* cpu, Voodoo2EC* voodoo) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
+        fprintf(stderr, "pcviper: SDL init failed: %s\n", SDL_GetError());
+        return 1;
+    }
+    SDL_Window* win = SDL_CreateWindow(
+        "PC-Viper 3D (VR5432 + Voodoo2 EC)", SDL_WINDOWPOS_CENTERED,
+        SDL_WINDOWPOS_CENTERED, VIPER_SDL_FB_W, VIPER_SDL_FB_H,
+        SDL_WINDOW_RESIZABLE);
+    if (!win) {
+        fprintf(stderr, "pcviper: SDL window failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+    SDL_Renderer* ren = SDL_CreateRenderer(
+        win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!ren)
+        ren = SDL_CreateRenderer(win, -1, 0);
+    if (!ren) {
+        fprintf(stderr, "pcviper: SDL renderer failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return 1;
+    }
+    SDL_Texture* tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                         SDL_TEXTUREACCESS_STREAMING,
+                                         VIPER_SDL_FB_W, VIPER_SDL_FB_H);
+    if (!tex) {
+        fprintf(stderr, "pcviper: SDL texture failed: %s\n", SDL_GetError());
+        SDL_DestroyRenderer(ren);
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return 1;
+    }
+
+    /* initial input: yaw 20 deg (matches the validated static frame) */
+    ViperInput in;
+    in.cy = 0.9396926f; in.sy = 0.3420201f;
+    in.cx = 1.0f; in.sx = 0.0f;
+    in.camz = 3.0f; in.tx = 0.0f; in.ty = 0.0f;
+    in.magic = VIPER_INPUT_MAGIC;
+    viper_input_write(bus, &in);
+
+    static uint32_t rgb[VIPER_SDL_FB_W * VIPER_SDL_FB_H];
+    voodoo2ec_update(voodoo, rgb, VIPER_SDL_FB_W, VIPER_SDL_FB_H);
+
+    float yaw_deg = 20.0f, pitch_deg = 0.0f;
+    float camz = 3.0f, tx = 0.0f, ty = 0.0f;
+
+    /* optional auto-quit for headless/CI smoke tests */
+    long auto_frames = 0;
+    const char* af = getenv("PCVIPER_SDL_FRAMES");
+    if (af) auto_frames = strtol(af, NULL, 10);
+
+    SDL_GameController* pad = NULL;
+    int quit = 0;
+    long shown = 0;
+    while (!quit) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) quit = 1;
+            else if (ev.type == SDL_KEYDOWN &&
+                     ev.key.keysym.sym == SDLK_ESCAPE) quit = 1;
+            else if (ev.type == SDL_CONTROLLERDEVICEADDED && !pad)
+                pad = SDL_GameControllerOpen(ev.cdevice.which);
+            else if (ev.type == SDL_CONTROLLERDEVICEREMOVED && pad) {
+                SDL_JoystickID jid = SDL_JoystickInstanceID(
+                    SDL_GameControllerGetJoystick(pad));
+                if (ev.cdevice.which == jid) {
+                    SDL_GameControllerClose(pad);
+                    pad = NULL;
+                }
+            }
+        }
+
+        const Uint8* k = SDL_GetKeyboardState(NULL);
+        float dyaw = 0.0f, dpitch = 0.0f;
+        float dtx = 0.0f, dty = 0.0f, dcam = 0.0f;
+        if (k[SDL_SCANCODE_LEFT])  dyaw   += 1.5f;
+        if (k[SDL_SCANCODE_RIGHT]) dyaw   -= 1.5f;
+        if (k[SDL_SCANCODE_UP])    dpitch += 1.5f;
+        if (k[SDL_SCANCODE_DOWN])  dpitch -= 1.5f;
+        if (k[SDL_SCANCODE_A])     dtx    -= 3.0f;
+        if (k[SDL_SCANCODE_D])     dtx    += 3.0f;
+        if (k[SDL_SCANCODE_W])     dty    -= 3.0f;
+        if (k[SDL_SCANCODE_S])     dty    += 3.0f;
+        if (k[SDL_SCANCODE_Z] || k[SDL_SCANCODE_EQUALS]) dcam += 0.05f;
+        if (k[SDL_SCANCODE_X] || k[SDL_SCANCODE_MINUS])  dcam -= 0.05f;
+
+        if (pad) {
+            Sint16 lx = SDL_GameControllerGetAxis(
+                pad, SDL_CONTROLLER_AXIS_LEFTX);
+            Sint16 ly = SDL_GameControllerGetAxis(
+                pad, SDL_CONTROLLER_AXIS_LEFTY);
+            if (abs(lx) > 8000) dyaw   += (float)lx / 32767.0f * 2.0f;
+            if (abs(ly) > 8000) dpitch += (float)ly / 32767.0f * 2.0f;
+            Sint16 rt = SDL_GameControllerGetAxis(
+                pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+            Sint16 lt = SDL_GameControllerGetAxis(
+                pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+            if (rt > 8000) dcam += (float)rt / 32767.0f * 0.06f;
+            if (lt > 8000) dcam -= (float)lt / 32767.0f * 0.06f;
+            if (SDL_GameControllerGetButton(
+                    pad, SDL_CONTROLLER_BUTTON_DPAD_LEFT)) dtx -= 3.0f;
+            if (SDL_GameControllerGetButton(
+                    pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) dtx += 3.0f;
+            if (SDL_GameControllerGetButton(
+                    pad, SDL_CONTROLLER_BUTTON_DPAD_UP)) dty -= 3.0f;
+            if (SDL_GameControllerGetButton(
+                    pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN)) dty += 3.0f;
+        }
+
+        yaw_deg += dyaw;
+        pitch_deg += dpitch;
+        if (pitch_deg > 89.0f) pitch_deg = 89.0f;
+        if (pitch_deg < -89.0f) pitch_deg = -89.0f;
+        camz += dcam;
+        if (camz < 1.2f) camz = 1.2f;
+        if (camz > 30.0f) camz = 30.0f;
+        tx += dtx; ty += dty;
+        if (tx > 640.0f) tx = 640.0f;
+        if (tx < -640.0f) tx = -640.0f;
+        if (ty > 480.0f) ty = 480.0f;
+        if (ty < -480.0f) ty = -480.0f;
+
+        in.cy = cosf(yaw_deg * M_PI / 180.0f);
+        in.sy = sinf(yaw_deg * M_PI / 180.0f);
+        in.cx = cosf(pitch_deg * M_PI / 180.0f);
+        in.sx = sinf(pitch_deg * M_PI / 180.0f);
+        in.camz = camz; in.tx = tx; in.ty = ty;
+        viper_input_write(bus, &in);
+
+        /* run one frame's worth of the demo firmware; it re-reads the
+         * input at the top of every loop iteration, so the next swap
+         * already uses the new transform */
+        vr5432_run(cpu, cpu->cycles + VIPER_SDL_CYCLES);
+        if (voodoo2ec_update(voodoo, rgb, VIPER_SDL_FB_W, VIPER_SDL_FB_H)) {
+            SDL_UpdateTexture(tex, NULL, rgb, VIPER_SDL_FB_W * 4);
+            SDL_RenderClear(ren);
+            SDL_RenderCopy(ren, tex, NULL, NULL);
+            SDL_RenderPresent(ren);
+            shown++;
+            if (auto_frames > 0 && shown >= auto_frames) quit = 1;
+        } else {
+            SDL_Delay(1);
+        }
+    }
+
+    if (pad) SDL_GameControllerClose(pad);
+    SDL_DestroyTexture(tex);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+    printf("pcviper: interactive demo: %ld frames shown\n", shown);
+    return 0;
+}
+#endif /* HAVE_SDL2 */
+
 int main(int argc, char** argv) {
     Bus* bus = bus_create();
     Voodoo2EC* voodoo = voodoo2ec_create();
@@ -452,9 +666,29 @@ int main(int argc, char** argv) {
     bus_register_mmio(bus, VIPER_PERIPH_MMIO, 0x1000ull, soc,
                       viper_mmio_read, viper_mmio_write);
 
-    if (argc > 1) {
-        if (bus_load_file(bus, argv[1], VIPER_ROM_BASE, VIPER_ROM_SIZE) != 0)
-            fprintf(stderr, "pcviper: using built-in boot program\n");
+    /* args: [rom.bin [cycles]] [--sdl|-i] [--cycles N] */
+    const char* rom = NULL;
+    uint64_t run_cycles = 100000;   /* covers a full demo3d frame (~43k) */
+    int interactive = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--sdl") == 0 || strcmp(argv[i], "-i") == 0) {
+            interactive = 1;
+        } else if (strcmp(argv[i], "--cycles") == 0) {
+            if (i + 1 < argc) run_cycles = strtoull(argv[++i], NULL, 0);
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "pcviper: unknown option '%s'\n", argv[i]);
+            return 1;
+        } else if (!rom) {
+            rom = argv[i];
+        } else {
+            run_cycles = strtoull(argv[i], NULL, 0);  /* 2nd positional: cycles */
+        }
+    }
+
+    if (rom) {
+        if (bus_load_file(bus, rom, VIPER_ROM_BASE, VIPER_ROM_SIZE) != 0)
+            fprintf(stderr, "pcviper: cannot load %s, using built-in boot program\n",
+                    rom);
     }
     if (!(bus->rom[0] | bus->rom[1] | bus->rom[2] | bus->rom[3])) {
         Prog boot;
@@ -472,7 +706,34 @@ int main(int argc, char** argv) {
 
     /* execute the boot: the CPU programs the Voodoo, SoC DMA and the
      * Aureal A3D channel entirely through the MIPS MMIO path */
-    uint64_t run_cycles = (argc > 2) ? strtoull(argv[2], NULL, 0) : 2000;
+    if (interactive) {
+        int rc;
+#ifdef HAVE_SDL2
+        if (!rom) {
+            fprintf(stderr, "pcviper: interactive mode requires a ROM "
+                            "(e.g. firmware/demo3d.bin)\n");
+            rc = 1;
+        } else {
+            printf("pcviper: interactive mode (SDL2). Keys: arrows = yaw/pitch, "
+                   "WASD = move, Z/X = zoom, ESC = quit.\n");
+            rc = interactive_demo(bus, &cpu, voodoo);
+        }
+#else
+        fprintf(stderr, "pcviper: interactive mode needs SDL2 "
+                        "(install libsdl2-dev and rebuild)\n");
+        rc = 1;
+#endif
+        bus_destroy(bus);
+        voodoo2ec_destroy(voodoo);
+        aureal_destroy(audio);
+        viper_soc_destroy(soc);
+        return rc;
+    }
+
+    /* optional headless input override (host -> firmware path) */
+    if (viper_input_from_env(bus))
+        printf("pcviper: wrote input block from PCVIPER_INPUT_* env\n");
+
     vr5432_run(&cpu, run_cycles);
 
     uint32_t color1 = voodoo2ec_reg_read(voodoo, V2_REG_COLOR1);

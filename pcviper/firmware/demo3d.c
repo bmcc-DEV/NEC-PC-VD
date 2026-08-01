@@ -6,8 +6,23 @@
  * the Voodoo2 EC hardware setup engine over MMIO for perspective-correct
  * textured triangle rasterization.
  *
+ * Every frame the firmware reads a host-written input block in SDRAM at
+ * physical 0x00000800 (KSEG0 0x80000800):
+ *
+ *   struct ViperInput {
+ *       float cy, sy;   // cos/sin of yaw   (rotation around Y)
+ *       float cx, sx;   // cos/sin of pitch (rotation around X)
+ *       float camz;     // camera distance  (zoom)
+ *       float tx, ty;   // screen-space translation (pixels)
+ *       uint32_t magic; // 0xA3D2EC01 when the host has written a valid block
+ *   };
+ *
+ * The emulator (main.c, SDL2 interactive mode) computes cy/sy/cx/sx on the
+ * host from keyboard/gamepad input and streams them here; the firmware still
+ * performs the full vertex transform + perspective projection on the FPU.
+ *
  * Cross-compile: mips64-elf-gcc -EL -mips4 -mhard-float -ffreestanding
- *   -nostdlib -mno-abicalls -G0 -O2, link at 0x1FC00000.
+ *   -nostdlib -mno-abicalls -G0 -O2, link at 0x1FC00000 (firmware/link.ld).
  */
 
 typedef unsigned int   uint32_t;
@@ -43,6 +58,18 @@ typedef unsigned short uint16_t;
 
 #define SX 640
 #define SY 480
+
+/* ---- host-written input block (physical 0x00000800, KSEG0) ---- */
+typedef struct {
+    float cy, sy;      /* cos/sin of yaw */
+    float cx, sx;      /* cos/sin of pitch */
+    float camz;        /* camera distance (zoom) */
+    float tx, ty;      /* screen translation */
+    uint32_t magic;    /* VIPER_INPUT_MAGIC when valid */
+} ViperInput;
+
+#define VIPER_INPUT       ((volatile ViperInput*)0x80000800ull)
+#define VIPER_INPUT_MAGIC 0xA3D2EC01u
 
 static inline uint32_t fbits(float f) {
     union { float f; uint32_t u; } c; c.f = f; return c.u;
@@ -94,48 +121,61 @@ static void put_vertex(float sx, float sy, float s, float t, float w) {
 
 static void triangle(const float p0[3], const float p1[3], const float p2[3],
                      int u0, int v0, int u1, int v1, int u2, int v2,
-                     float ca, float sa) {
+                     float cy, float sy, float cx, float sx,
+                     float camz, float tx, float ty) {
     const float focal = (float)SY / 2.0f;
-    const float camz = 3.0f;
-    float sx[3], sy[3], w[3];
+    float sxv[3], syv[3], w[3];
     for (int i = 0; i < 3; i++) {
         const float* p = i == 0 ? p0 : (i == 1 ? p1 : p2);
-        float x = p[0] * ca + p[2] * sa;
-        float z = -p[0] * sa + p[2] * ca;
-        float y = p[1];
+        /* rotate around Y (yaw), then around X (pitch) */
+        float x = p[0] * cy + p[2] * sy;
+        float z1 = -p[0] * sy + p[2] * cy;
+        float y = p[1] * cx - z1 * sx;
+        float z = p[1] * sx + z1 * cx;
         float zc = z + camz;
         if (zc < 0.1f) zc = 0.1f;
         float inv = 1.0f / zc;
         w[i] = inv;
-        sx[i] = x * inv * focal + (float)SX / 2.0f;
-        sy[i] = -(y * inv * focal) + (float)SY / 2.0f;
+        sxv[i] = x * inv * focal + (float)SX / 2.0f + tx;
+        syv[i] = -(y * inv * focal) + (float)SY / 2.0f + ty;
     }
-    float area = (sx[1] - sx[0]) * (sy[2] - sy[0]) -
-                 (sy[1] - sy[0]) * (sx[2] - sx[0]);
-    
+    float area = (sxv[1] - sxv[0]) * (syv[2] - syv[0]) -
+                 (syv[1] - syv[0]) * (sxv[2] - sxv[0]);
+    (void)area;
+
     V2_R(R_SETUPMODE) = 0x31u;
-    put_vertex(sx[0], sy[0], (float)u0, (float)v0, w[0]);
+    put_vertex(sxv[0], syv[0], (float)u0, (float)v0, w[0]);
     V2_R(R_SBTTRI) = 1;
-    put_vertex(sx[1], sy[1], (float)u1, (float)v1, w[1]);
+    put_vertex(sxv[1], syv[1], (float)u1, (float)v1, w[1]);
     V2_R(R_SDRAWTRI) = 1;
-    put_vertex(sx[2], sy[2], (float)u2, (float)v2, w[2]);
+    put_vertex(sxv[2], syv[2], (float)u2, (float)v2, w[2]);
     V2_R(R_SDRAWTRI) = 1;
 }
 
 void main_c(void) {
-    const float ca = 0.9396926f, sa = 0.3420201f;
+    /* defaults match the original validated static frame (yaw 20 deg) */
+    float cy = 0.9396926f, sy = 0.3420201f;
+    float cx = 1.0f, sx = 0.0f;
+    float camz = 3.0f, tx = 0.0f, ty = 0.0f;
+
     voodoo_setup();
     while (1) {
+        const volatile ViperInput* in = VIPER_INPUT;
+        if (in->magic == VIPER_INPUT_MAGIC) {
+            cy = in->cy; sy = in->sy;
+            cx = in->cx; sx = in->sx;
+            camz = in->camz; tx = in->tx; ty = in->ty;
+        }
         V2_R(R_COLOR1) = 0x00000000u;
         V2_R(R_FASTFILL) = 1;
         V2_R(R_SETUPMODE) = 0x31u;
         for (int f = 0; f < 6; f++) {
             triangle(face[f][0], face[f][1], face[f][2],
                      uv[f][0][0], uv[f][0][1], uv[f][1][0], uv[f][1][1],
-                     uv[f][2][0], uv[f][2][1], ca, sa);
+                     uv[f][2][0], uv[f][2][1], cy, sy, cx, sx, camz, tx, ty);
             triangle(face[f][0], face[f][2], face[f][3],
                      uv[f][0][0], uv[f][0][1], uv[f][2][0], uv[f][2][1],
-                     uv[f][3][0], uv[f][3][1], ca, sa);
+                     uv[f][3][0], uv[f][3][1], cy, sy, cx, sx, camz, tx, ty);
         }
         V2_R(R_SWAP) = 0;
     }
