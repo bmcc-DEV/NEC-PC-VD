@@ -9,12 +9,23 @@
 #include "vr5432.h"
 #include "voodoo2_ec.h"
 #include "voodoo_fifo.h"
+#include "aureal_a3d.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+
+#ifdef HAVE_SDL2
+#include <SDL2/SDL.h>
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #define VIPER_VOODOO_MMIO 0x10000000ull
 #define VIPER_VOODOO_KSEG1 0xB0000000ull   /* KSEG1 -> physical 0x10000000 */
+#define VIPER_AUREAL_MMIO 0x14000000ull
 
 /* Programa de boot embutido (hand-assembled MIPS IV, little-endian):
  *   lui $8, 0xB000; daddiu $8, $8, 0x148; lui $9, 0x00FF
@@ -44,6 +55,98 @@ static uint32_t voodoo_mmio_read(void* ctx, uint64_t offset) {
 
 static void voodoo_mmio_write(void* ctx, uint64_t offset, uint32_t data, uint32_t mask) {
     voodoo2ec_write((Voodoo2EC*)ctx, (uint32_t)offset, data, mask);
+}
+
+static uint32_t aureal_mmio_read(void* ctx, uint64_t offset) {
+    return aureal_read((AurealA3D*)ctx, (uint32_t)offset);
+}
+
+static void aureal_mmio_write(void* ctx, uint64_t offset, uint32_t data, uint32_t mask) {
+    aureal_write((AurealA3D*)ctx, (uint32_t)offset, data, mask);
+}
+
+static void write_wav(const char* path, const int16_t* buf, int frames) {
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "main: cannot write %s\n", path); return; }
+    uint32_t data_len = (uint32_t)frames * 4;
+    fwrite("RIFF", 1, 4, f);
+    uint32_t v32 = 36 + data_len;
+    fwrite(&v32, 4, 1, f);
+    fwrite("WAVE", 1, 4, f);
+    fwrite("fmt ", 1, 4, f);
+    v32 = 16; fwrite(&v32, 4, 1, f);
+    uint16_t v16 = 1; fwrite(&v16, 2, 1, f);   /* PCM */
+    v16 = 2; fwrite(&v16, 2, 1, f);            /* stereo */
+    v32 = AUREAL_RATE; fwrite(&v32, 4, 1, f);
+    v32 = AUREAL_RATE * 4; fwrite(&v32, 4, 1, f);  /* byte rate */
+    v16 = 4; fwrite(&v16, 2, 1, f);            /* block align */
+    v16 = 16; fwrite(&v16, 2, 1, f);           /* bits per sample */
+    fwrite("data", 1, 4, f);
+    fwrite(&data_len, 4, 1, f);
+    fwrite(buf, 1, data_len, f);
+    fclose(f);
+    printf("pcviper: wrote %s (%d frames)\n", path, frames);
+}
+
+static void a3d_demo(AurealA3D* a, Bus* bus) {
+    /* A-major chord: A4, C#5, E5 (16-bit PCM loops in RAM) */
+    const float notes[3] = { 440.0f, 554.37f, 659.25f };
+    const uint32_t srcs[3] = { 0x000000u, 0x018000u, 0x030000u };
+    for (int n = 0; n < 3; n++) {
+        for (int i = 0; i < 48000; i++) {
+            int16_t s = (int16_t)(sinf(2.0f * (float)M_PI * notes[n] * i / 48000.0f)
+                                  * 12000.0f);
+            bus_write16(bus, (uint64_t)srcs[n] + (uint64_t)i * 2, (uint16_t)s);
+        }
+    }
+    const float az[3] = { -45.0f, 0.0f, 45.0f };
+    for (int c = 0; c < 3; c++) {
+        int base = A3D_CHAN_BASE + c * A3D_CHAN_STRIDE;
+        uint32_t azb;
+        memcpy(&azb, &az[c], 4);
+        aureal_reg_write(a, base + A3D_CH_SRC, srcs[c]);
+        aureal_reg_write(a, base + A3D_CH_LEN, 48000u);
+        aureal_reg_write(a, base + A3D_CH_PITCH, 0x10000u);
+        aureal_reg_write(a, base + A3D_CH_VOL_L, 0xFFFFu);
+        aureal_reg_write(a, base + A3D_CH_VOL_R, 0xFFFFu);
+        aureal_reg_write(a, base + A3D_CH_AZIMUTH, azb);
+        aureal_reg_write(a, base + A3D_CH_REVERB, (c == 1) ? 0x6000u : 0x2000u);
+        aureal_reg_write(a, base + A3D_CH_CTRL, 3u);   /* enable + loop */
+    }
+
+    int seconds = 3;
+    int frames = AUREAL_RATE * seconds;
+    int16_t* mix = malloc((size_t)frames * 4);
+    if (!mix) return;
+    aureal_render(a, mix, frames);
+
+    printf("pcviper: aureal a3d demo (%d channels @ %d Hz)\n",
+           AUREAL_CHANNELS, AUREAL_RATE);
+
+#ifdef HAVE_SDL2
+    if (SDL_Init(SDL_INIT_AUDIO) == 0) {
+        SDL_AudioSpec want;
+        memset(&want, 0, sizeof(want));
+        want.freq = AUREAL_RATE;
+        want.format = AUDIO_S16SYS;
+        want.channels = 2;
+        want.samples = 1024;
+        SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
+        if (dev) {
+            SDL_QueueAudio(dev, mix, (uint32_t)frames * 4);
+            SDL_PauseAudioDevice(dev, 0);
+            SDL_Delay((uint32_t)seconds * 1000);
+            SDL_CloseAudioDevice(dev);
+            SDL_Quit();
+            printf("pcviper: played %d s of A3D audio via SDL2\n", seconds);
+            free(mix);
+            return;
+        }
+        SDL_Quit();
+    }
+#endif
+    write_wav("aureal.wav", mix, frames);
+    free(mix);
 }
 
 static void write_ppm(const char* path, const uint32_t* rgb, int w, int h) {
@@ -130,14 +233,19 @@ static void voodoo_demo(Voodoo2EC* v) {
 int main(int argc, char** argv) {
     Bus* bus = bus_create();
     Voodoo2EC* voodoo = voodoo2ec_create();
-    if (!bus || !voodoo) {
+    AurealA3D* audio = aureal_create();
+    if (!bus || !voodoo || !audio) {
         fprintf(stderr, "pcviper: allocation failed\n");
         return 1;
     }
+    aureal_set_bus(audio, bus);
 
     /* Voodoo2 EC MMIO at physical 0x10000000 (16 MB aperture) */
     bus_register_mmio(bus, VIPER_VOODOO_MMIO, VOODOO2_EC_SGRAM_SIZE, voodoo,
                       voodoo_mmio_read, voodoo_mmio_write);
+    /* Aureal A3D MMIO at physical 0x14000000 (16 KB register window) */
+    bus_register_mmio(bus, VIPER_AUREAL_MMIO, 0x4000ull, audio,
+                      aureal_mmio_read, aureal_mmio_write);
 
     if (argc > 1) {
         if (bus_load_file(bus, argv[1], VIPER_ROM_BASE, VIPER_ROM_SIZE) != 0)
@@ -164,8 +272,10 @@ int main(int argc, char** argv) {
                                    : "CPU -> MMIO: unexpected value");
 
     voodoo_demo(voodoo);
+    a3d_demo(audio, bus);
 
     bus_destroy(bus);
     voodoo2ec_destroy(voodoo);
+    aureal_destroy(audio);
     return 0;
 }

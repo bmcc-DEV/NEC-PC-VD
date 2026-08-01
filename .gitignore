@@ -6,6 +6,7 @@ build/
 pcviper/build/
 pcviper/pcviper_emulator
 pcviper/voodoo.ppm
+pcviper/aureal.wav
 
 # Generated files
 emulator/roms/pcvd_bios.bin
