@@ -2,6 +2,10 @@
 emulator/build/
 build/
 
+# PC-Viper build output
+pcviper/build/
+pcviper/pcviper_emulator
+
 # Generated files
 emulator/roms/pcvd_bios.bin
 emulator/roms/test_code.bin
