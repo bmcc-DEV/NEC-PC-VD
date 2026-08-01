@@ -33,7 +33,7 @@ echo "  total: $total_pass PASS / $total_fail FAIL"
 echo "[3/4] Emulator run (all subsystems)"
 rm -f voodoo.ppm glide.ppm aureal.wav
 SDL_AUDIODRIVER=dummy timeout 20 ./pcviper_emulator 2>&1 \
-    | grep -E "CPU -> MMIO OK|multitexture OK|glide textured|soc DMA|memcard slot0|played|aureal"
+    | grep -E "CPU -> MMIO OK|CPU->SoC DMA|CPU->A3D channel regs|CPU->A3D audio|multitexture OK|glide textured|soc DMA DVD|memcard slot0|played|wrote aureal"
 echo "  emulator exit: $?"
 
 echo "[4/4] Artifact checks"

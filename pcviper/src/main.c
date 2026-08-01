@@ -30,20 +30,115 @@
 #define VIPER_AUREAL_MMIO 0x14000000ull
 #define VIPER_PERIPH_MMIO 0x1E000000ull
 
-/* Programa de boot embutido (hand-assembled MIPS IV, little-endian):
- *   lui $8, 0xB000; daddiu $8, $8, 0x148; lui $9, 0x00FF
- *   ori $9, $9, 0; sw $9, 0($8); beq $0,$0,-1; nop
- * Escreve color1 = 0x00FF0000 (vermelho) no registrador do Voodoo2 EC
- * através do barramento MIPS (prova o caminho CPU -> MMIO). */
-static const uint32_t s_builtin_boot[] = {
-    0x3C08B000u,  /* lui  $8, 0xB000 */
-    0x65080148u,  /* daddiu $8, $8, 0x148 */
-    0x3C0900FFu,  /* lui  $9, 0x00FF */
-    0x35290000u,  /* ori  $9, $9, 0 */
-    0xAD090000u,  /* sw   $9, 0($8) */
-    0x1000FFFFu,  /* beq  $0, $0, -1 (loop) */
-    0x00000000u,  /* nop (delay slot) */
-};
+/* ---- tiny MIPS IV assembler for the boot program ---- */
+typedef struct {
+    uint32_t w[512];
+    int n;
+} Prog;
+
+static void p_emit(Prog* p, uint32_t w) { p->w[p->n++] = w; }
+static void p_lui(Prog* p, int rt, uint16_t imm) {
+    p_emit(p, (0x0Fu << 26) | ((uint32_t)rt << 16) | imm);
+}
+static void p_ori(Prog* p, int rt, int rs, uint16_t imm) {
+    p_emit(p, (0x0Du << 26) | ((uint32_t)rs << 21) | ((uint32_t)rt << 16) | imm);
+}
+static void p_sw(Prog* p, int rt, int rs, int16_t off) {
+    p_emit(p, (0x2Bu << 26) | ((uint32_t)rs << 21) | ((uint32_t)rt << 16) |
+              ((uint32_t)off & 0xFFFF));
+}
+static void p_beq(Prog* p, int rs, int rt, int16_t off) {
+    p_emit(p, (0x04u << 26) | ((uint32_t)rs << 21) | ((uint32_t)rt << 16) |
+              ((uint32_t)off & 0xFFFF));
+}
+static void p_nop(Prog* p) { p_emit(p, 0); }
+static void p_li(Prog* p, int rt, uint32_t v) {
+    p_lui(p, rt, (uint16_t)(v >> 16));
+    if (v & 0xFFFF) p_ori(p, rt, rt, (uint16_t)v);
+}
+
+/* Boot program: programs the Voodoo2 EC color1, the Viper SoC DMA
+ * (DVD -> RAM) and the Aureal A3D channel 0 entirely through CPU MMIO. */
+static void build_boot(Prog* p) {
+    /* Voodoo color1 = red via KSEG1 0xB0000148 */
+    p_li(p, 8, 0xB0000000u + 0x148);
+    p_li(p, 9, 0x00FF0000u);
+    p_sw(p, 9, 8, 0);
+
+    /* SoC DMA: DVD LBA 0 -> RAM 0x100000, 4096 bytes (KSEG1 0xBE000000) */
+    p_li(p, 8, 0xBE000000u);
+    p_li(p, 9, 0);
+    p_sw(p, 9, 8, 0x04);      /* DMA_SRC */
+    p_li(p, 9, 0x100000);
+    p_sw(p, 9, 8, 0x08);      /* DMA_DST */
+    p_li(p, 9, 4096);
+    p_sw(p, 9, 8, 0x0C);      /* DMA_SIZE */
+    p_li(p, 9, 1);
+    p_sw(p, 9, 8, 0x00);      /* DMA_CTRL start */
+
+    /* A3D channel 0 at KSEG1 0xB4000000 + 0x40 */
+    p_li(p, 8, 0xB4000000u + 0x40);
+    p_li(p, 9, 0x100000);     /* SRC = RAM (DVD data) */
+    p_sw(p, 9, 8, 0x08);      /* A3D_CH_SRC */
+    p_li(p, 9, 4096);         /* LEN = 4096 bytes (2048 samples) */
+    p_sw(p, 9, 8, 0x0C);      /* A3D_CH_LEN */
+    p_li(p, 9, 0x10000);      /* PITCH 1.0 */
+    p_sw(p, 9, 8, 0x04);      /* A3D_CH_PITCH */
+    p_li(p, 9, 0xFFFF);
+    p_sw(p, 9, 8, 0x14);      /* A3D_CH_VOL_L */
+    p_sw(p, 9, 8, 0x18);      /* A3D_CH_VOL_R */
+    p_li(p, 9, 0xC2340000u);  /* AZIMUTH = -45.0f */
+    p_sw(p, 9, 8, 0x28);      /* A3D_CH_AZIMUTH */
+    p_li(p, 9, 3);            /* enable + loop */
+    p_sw(p, 9, 8, 0x00);      /* A3D_CH_CTRL */
+
+    p_beq(p, 0, 0, -1);
+    p_nop(p);
+}
+
+/* Validate what the CPU programmed through the MMIO path. */
+static void cpu_driven_validate(Bus* bus, AurealA3D* audio, ViperSoC* soc) {
+    int ok = 1;
+
+    /* SoC DMA done bit */
+    ok = (viper_soc_reg_read(soc, VIPER_DMA_STATUS) & 2) != 0;
+    printf("pcviper: CPU->SoC DMA status: %s\n", ok ? "OK (done)" : "FAIL");
+
+    /* SoC DMA: RAM 0x100000 must contain the DVD pattern */
+    ok = 1;
+    for (int i = 0; i < 4096; i++) {
+        uint32_t d = i;
+        if (bus_read8(bus, 0x100000 + i) != (uint8_t)((d / 2048) + (d % 2048))) {
+            ok = 0;
+            break;
+        }
+    }
+    printf("pcviper: CPU->SoC DMA: %s\n", ok ? "OK (DVD pattern in RAM)" : "FAIL");
+
+    /* A3D channel 0 registers programmed by the CPU */
+    int base = A3D_CHAN_BASE;
+    ok = 1;
+    if (aureal_reg_read(audio, base + A3D_CH_SRC) != 0x100000) ok = 0;
+    if (aureal_reg_read(audio, base + A3D_CH_LEN) != 4096) ok = 0;
+    if (aureal_reg_read(audio, base + A3D_CH_PITCH) != 0x10000) ok = 0;
+    if (aureal_reg_read(audio, base + A3D_CH_CTRL) != 3) ok = 0;
+    printf("pcviper: CPU->A3D channel regs: %s\n", ok ? "OK" : "FAIL");
+
+    /* render audio driven by the CPU-programmed channel */
+    int16_t mix[4800 * 2];
+    aureal_render(audio, mix, 4800);
+    double rms_l = 0, rms_r = 0;
+    for (int i = 0; i < 4800; i++) {
+        rms_l += (double)mix[2 * i] * mix[2 * i];
+        rms_r += (double)mix[2 * i + 1] * mix[2 * i + 1];
+    }
+    rms_l = sqrt(rms_l / 4800);
+    rms_r = sqrt(rms_r / 4800);
+    printf("pcviper: CPU->A3D audio L RMS=%.0f R RMS=%.0f %s\n",
+           rms_l, rms_r,
+           (rms_l > 1000.0 && rms_l > rms_r * 1.4) ? "OK (left pan, -45 deg)"
+                                                   : "unexpected");
+}
 
 static uint32_t fbits(float v) {
     uint32_t b;
@@ -353,8 +448,12 @@ int main(int argc, char** argv) {
             fprintf(stderr, "pcviper: using built-in boot program\n");
     }
     if (!(bus->rom[0] | bus->rom[1] | bus->rom[2] | bus->rom[3])) {
-        memcpy(bus->rom, s_builtin_boot, sizeof(s_builtin_boot));
-        printf("pcviper: loaded built-in boot program at 0xBFC00000\n");
+        Prog boot;
+        boot.n = 0;
+        build_boot(&boot);
+        memcpy(bus->rom, boot.w, (size_t)boot.n * 4);
+        printf("pcviper: loaded built-in boot program at 0xBFC00000 "
+               "(%d instrs)\n", boot.n);
     }
 
     Vr5432 cpu;
@@ -362,7 +461,8 @@ int main(int argc, char** argv) {
     printf("pcviper: running VR5432 (reset vector 0x%08llX)\n",
            (unsigned long long)cpu.pc);
 
-    /* execute the boot: the CPU writes color1 through the MIPS bus */
+    /* execute the boot: the CPU programs the Voodoo, SoC DMA and the
+     * Aureal A3D channel entirely through the MIPS MMIO path */
     uint64_t run_cycles = (argc > 2) ? strtoull(argv[2], NULL, 0) : 300;
     vr5432_run(&cpu, run_cycles);
 
@@ -371,6 +471,8 @@ int main(int argc, char** argv) {
     printf("pcviper: %s\n",
            (color1 == 0x00FF0000u) ? "CPU -> MMIO OK (0xB0000148)"
                                    : "CPU -> MMIO: unexpected value");
+
+    cpu_driven_validate(bus, audio, soc);
 
     voodoo_demo(voodoo);
     glide_demo(voodoo);
