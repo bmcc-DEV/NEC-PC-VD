@@ -10,6 +10,8 @@
 #include "voodoo2_ec.h"
 #include "voodoo_fifo.h"
 #include "aureal_a3d.h"
+#include "viper_system.h"
+#include "glide.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +28,7 @@
 #define VIPER_VOODOO_MMIO 0x10000000ull
 #define VIPER_VOODOO_KSEG1 0xB0000000ull   /* KSEG1 -> physical 0x10000000 */
 #define VIPER_AUREAL_MMIO 0x14000000ull
+#define VIPER_PERIPH_MMIO 0x1E000000ull
 
 /* Programa de boot embutido (hand-assembled MIPS IV, little-endian):
  *   lui $8, 0xB000; daddiu $8, $8, 0x148; lui $9, 0x00FF
@@ -48,6 +51,8 @@ static uint32_t fbits(float v) {
     return b;
 }
 
+static void write_ppm(const char* path, const uint32_t* rgb, int w, int h);
+
 /* MMIO bridge: adapt the device API to the bus handler signatures */
 static uint32_t voodoo_mmio_read(void* ctx, uint64_t offset) {
     return voodoo2ec_read((Voodoo2EC*)ctx, (uint32_t)offset);
@@ -63,6 +68,14 @@ static uint32_t aureal_mmio_read(void* ctx, uint64_t offset) {
 
 static void aureal_mmio_write(void* ctx, uint64_t offset, uint32_t data, uint32_t mask) {
     aureal_write((AurealA3D*)ctx, (uint32_t)offset, data, mask);
+}
+
+static uint32_t viper_mmio_read(void* ctx, uint64_t offset) {
+    return viper_soc_read((ViperSoC*)ctx, (uint32_t)offset);
+}
+
+static void viper_mmio_write(void* ctx, uint64_t offset, uint32_t data, uint32_t mask) {
+    viper_soc_write((ViperSoC*)ctx, (uint32_t)offset, data, mask);
 }
 
 static void write_wav(const char* path, const int16_t* buf, int frames) {
@@ -147,6 +160,89 @@ static void a3d_demo(AurealA3D* a, Bus* bus) {
 #endif
     write_wav("aureal.wav", mix, frames);
     free(mix);
+}
+
+static void glide_demo(Voodoo2EC* voodoo) {
+    GrContext ctx;
+    ctx.voodoo = voodoo;
+    grGlideInit();
+    grSstSelect(0);
+    grSstWinOpen(&ctx, 0, 640, 480, 2, 0);
+
+    /* textured triangle via the Glide API (offset from the CMDFIFO demo) */
+    uint8_t tex[16 * 16 * 2];
+    for (int t = 0; t < 16; t++)
+        for (int s = 0; s < 16; s++) {
+            uint16_t c = (s < 8) ? 0xF800u : 0x001Fu;
+            tex[(t * 16 + s) * 2 + 0] = (uint8_t)(c & 0xFF);
+            tex[(t * 16 + s) * 2 + 1] = (uint8_t)(c >> 8);
+        }
+    GrTexInfo ti;
+    ti.smallLod = 4;
+    ti.largeLod = 4;
+    ti.aspectRatio = 1.0f;
+    ti.format = GR_TEXFMT_RGB_565;
+    ti.data = tex;
+    grTexUpload(&ctx, GR_TMU0, &ti);
+    grTexBind(&ctx, GR_TMU0, &ti);
+    grColorCombine(&ctx, 1, 0);
+    grBufferClear(&ctx, 0x00000000u, GR_BUFFER_BACKBUFFER);
+
+    grBeginTriangles(&ctx);
+    GrVertex v;
+    memset(&v, 0, sizeof(v));
+    v.x = 150; v.y = 100; v.w = 1.0f; v.r = 255; v.g = 255; v.b = 255;
+    v.s0 = 0; v.t0 = 0;
+    grVertex(&ctx, &v);
+    v.x = 550; v.y = 100; v.w = 1.0f; v.s0 = 16; v.t0 = 0;
+    grVertex(&ctx, &v);
+    v.x = 350; v.y = 450; v.w = 1.0f; v.s0 = 8; v.t0 = 16;
+    grVertex(&ctx, &v);
+    grEndTriangles(&ctx);
+
+    grBufferSwap(&ctx, GR_BUFFER_BACKBUFFER);
+    static uint32_t rgb[640 * 480];
+    memset(rgb, 0, sizeof(rgb));
+    grSplash(&ctx, 0, 0, 640, 480, 0, rgb);
+
+    uint32_t l = rgb[250 + 200 * 640];
+    uint32_t r = rgb[450 + 200 * 640];
+    printf("pcviper: glide demo left=0x%08X right=0x%08X\n", l, r);
+    printf("pcviper: %s\n",
+           (l == 0xFFFF0000u && r == 0xFF0000FFu) ? "glide textured triangle OK"
+                                                  : "glide: unexpected output");
+    write_ppm("glide.ppm", rgb, 640, 480);
+    grSstWinClose(&ctx);
+    grGlideShutdown();
+}
+
+static void soc_demo(ViperSoC* soc, Bus* bus) {
+    /* DMA 4 sectors from DVD LBA 2 into RAM 0x4000 */
+    viper_soc_reg_write(soc, VIPER_DMA_SRC, 2);
+    viper_soc_reg_write(soc, VIPER_DMA_DST, 0x4000);
+    viper_soc_reg_write(soc, VIPER_DMA_SIZE, 4 * VIPER_DVD_SECTOR);
+    viper_soc_reg_write(soc, VIPER_DMA_CTRL, 1);
+    int ok = 1;
+    for (int i = 0; i < 4 * VIPER_DVD_SECTOR; i++) {
+        uint32_t d = 2 * 2048 + i;
+        if (bus_read8(bus, 0x4000 + i) != (uint8_t)((d / 2048) + (d % 2048))) {
+            ok = 0;
+            break;
+        }
+    }
+    printf("pcviper: soc DMA DVD->RAM: %s (%llu sectors, status=0x%02X)\n",
+           ok ? "OK" : "FAIL",
+           (unsigned long long)viper_soc_dvd_sectors(soc),
+           viper_soc_reg_read(soc, VIPER_DMA_STATUS));
+
+    /* memory card slot 0 write/read */
+    viper_soc_reg_write(soc, VIPER_MCD0_ADDR, 0x40);
+    viper_soc_reg_write(soc, VIPER_MCD0_DATA, 0xA3D2EC01u);
+    viper_soc_reg_write(soc, VIPER_MCD0_CTRL, 1);
+    viper_soc_reg_write(soc, VIPER_MCD0_CTRL, 2);
+    uint32_t mcd = viper_soc_reg_read(soc, VIPER_MCD0_DATA);
+    printf("pcviper: soc memcard slot0: 0x%08X %s\n", mcd,
+           (mcd == 0xA3D2EC01u) ? "OK" : "FAIL");
 }
 
 static void write_ppm(const char* path, const uint32_t* rgb, int w, int h) {
@@ -234,11 +330,13 @@ int main(int argc, char** argv) {
     Bus* bus = bus_create();
     Voodoo2EC* voodoo = voodoo2ec_create();
     AurealA3D* audio = aureal_create();
-    if (!bus || !voodoo || !audio) {
+    ViperSoC* soc = viper_soc_create();
+    if (!bus || !voodoo || !audio || !soc) {
         fprintf(stderr, "pcviper: allocation failed\n");
         return 1;
     }
     aureal_set_bus(audio, bus);
+    viper_soc_set_bus(soc, bus);
 
     /* Voodoo2 EC MMIO at physical 0x10000000 (16 MB aperture) */
     bus_register_mmio(bus, VIPER_VOODOO_MMIO, VOODOO2_EC_SGRAM_SIZE, voodoo,
@@ -246,6 +344,9 @@ int main(int argc, char** argv) {
     /* Aureal A3D MMIO at physical 0x14000000 (16 KB register window) */
     bus_register_mmio(bus, VIPER_AUREAL_MMIO, 0x4000ull, audio,
                       aureal_mmio_read, aureal_mmio_write);
+    /* Viper SoC MMIO at physical 0x1E000000 (4 KB) */
+    bus_register_mmio(bus, VIPER_PERIPH_MMIO, 0x1000ull, soc,
+                      viper_mmio_read, viper_mmio_write);
 
     if (argc > 1) {
         if (bus_load_file(bus, argv[1], VIPER_ROM_BASE, VIPER_ROM_SIZE) != 0)
@@ -272,10 +373,13 @@ int main(int argc, char** argv) {
                                    : "CPU -> MMIO: unexpected value");
 
     voodoo_demo(voodoo);
+    glide_demo(voodoo);
+    soc_demo(soc, bus);
     a3d_demo(audio, bus);
 
     bus_destroy(bus);
     voodoo2ec_destroy(voodoo);
     aureal_destroy(audio);
+    viper_soc_destroy(soc);
     return 0;
 }
