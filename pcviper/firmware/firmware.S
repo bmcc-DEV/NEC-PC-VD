@@ -11,7 +11,7 @@
  *   7. syscall exception (handler + eret)
  *   8. MMIO: Voodoo2 EC color1, Viper SoC DMA, Aureal A3D channel
  *
- * On success a POST word 0xA3D2_00FF is stored at RAM 0x0000F000
+ * On success a POST word 0xA3D2_01FF is stored at RAM 0x0000F000
  * (KSEG1 0xA000F000); each failing test leaves its bit clear.
  */
 
@@ -132,8 +132,34 @@ _start:
     nop
     ori  $s0, $s0, 0x40         /* syscall ok */
 
-    /* ---- 8. MMIO: Voodoo2 EC color1 ---- */
+    /* ---- 8. timer interrupt (Count/Compare -> IP7) ----
+     * program Compare ~100 cycles ahead, enable IE+IM7 and spin until
+     * the shared exception handler raises the interrupt flag. */
 .t8:
+    li   $t1, 0xA000F200
+    sw   $zero, 0($t1)          /* clear the interrupt flag */
+    mfc0 $t0, $9                /* Count */
+    addiu $t0, $t0, 100
+    mtc0 $t0, $11               /* Compare = Count + 100 */
+    mfc0 $t0, $12               /* Status */
+    ori  $t0, $t0, 0x8001       /* IM7 + IE */
+    mtc0 $t0, $12
+    li   $t2, 0                 /* timeout guard */
+.wait_int:
+    lw   $t3, 0($t1)
+    bnez $t3, .int_ok
+    nop
+    addiu $t2, $t2, 1
+    slti $t3, $t2, 4000
+    bnez $t3, .wait_int
+    nop
+    b    .t9                    /* timeout: leave the bit clear */
+    nop
+.int_ok:
+    ori  $s0, $s0, 0x100        /* interrupt ok */
+
+    /* ---- 9. MMIO: Voodoo2 EC color1 ---- */
+.t9:
     li   $t0, 0xB0000148
     li   $t1, 0x00FF0000
     sw   $t1, 0($t0)
@@ -177,11 +203,26 @@ _start:
     /* ---- general exception vector (BEV=1 -> 0xBFC00380) ---- */
     .org 0x380
 _exception_vector:
+    mfc0 $k0, $13               /* Cause */
+    andi $k1, $k0, 0x7C         /* EXCode << 2 */
+    li   $k0, 0x20              /* EXC_SYSCALL (8) << 2 */
+    bne  $k1, $k0, .handler_int
+    nop
+    /* syscall: skip the instruction and count it */
     mfc0 $k0, $14               /* EPC */
-    daddiu $k0, $k0, 4          /* skip the faulting instruction */
+    daddiu $k0, $k0, 4
     mtc0 $k0, $14
     li   $k1, 0xA000F100
     lw   $k0, 0($k1)
     addiu $k0, $k0, 1
+    sw   $k0, 0($k1)
+    eret
+.handler_int:
+    /* interrupt: clear IP7, raise the flag, return to the same EPC */
+    mfc0 $k0, $13
+    andi $k0, $k0, 0x7FFF
+    mtc0 $k0, $13
+    li   $k1, 0xA000F200
+    li   $k0, 1
     sw   $k0, 0($k1)
     eret

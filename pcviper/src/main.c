@@ -463,7 +463,7 @@ int main(int argc, char** argv) {
 
     /* execute the boot: the CPU programs the Voodoo, SoC DMA and the
      * Aureal A3D channel entirely through the MIPS MMIO path */
-    uint64_t run_cycles = (argc > 2) ? strtoull(argv[2], NULL, 0) : 300;
+    uint64_t run_cycles = (argc > 2) ? strtoull(argv[2], NULL, 0) : 2000;
     vr5432_run(&cpu, run_cycles);
 
     uint32_t color1 = voodoo2ec_reg_read(voodoo, V2_REG_COLOR1);
@@ -474,7 +474,7 @@ int main(int argc, char** argv) {
 
     uint32_t post = bus_read32(bus, 0x0000F000ull);
     printf("pcviper: firmware POST code = 0x%08X %s\n", post,
-           (post == 0xA3D200FFu) ? "READY (all CPU/FPU/MMIO self-tests OK)"
+           (post == 0xA3D201FFu) ? "READY (all CPU/FPU/MMIO self-tests OK)"
                                  : "(incomplete)");
 
     cpu_driven_validate(bus, audio, soc);

@@ -1019,7 +1019,7 @@ static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay
         } else if (rs == 0x04) { /* MTC0 */
             switch (rd & 0x1F) {
             case CP0_STATUS:
-                c->cp0[CP0_STATUS] = c->gpr[rt] & 0xFF00FFFFull;
+                c->cp0[CP0_STATUS] = c->gpr[rt];   /* full write keeps BEV/IM/IE */
                 break;
             case CP0_COUNT:
                 c->cp0[CP0_COUNT] = c->gpr[rt];
