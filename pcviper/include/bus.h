@@ -33,14 +33,32 @@
 #define VIPER_ROM_BASE     0x1FC00000ull
 #define VIPER_ROM_SIZE     0x00040000ull    /* 256 KB */
 
+/* MMIO handler: read/write a 32-bit word at a byte offset within a region */
+typedef uint32_t (*bus_mmio_read_fn)(void* ctx, uint64_t offset);
+typedef void (*bus_mmio_write_fn)(void* ctx, uint64_t offset, uint32_t data,
+                                  uint32_t mask);
+
+typedef struct BusMmio {
+    void* ctx;
+    uint64_t base;
+    uint64_t size;
+    bus_mmio_read_fn read;
+    bus_mmio_write_fn write;
+} BusMmio;
+
+#define VIPER_MAX_MMIO 8
+
 typedef struct Bus {
     uint8_t* ram;       /* 64 MB SDRAM */
-    uint8_t* voodoo;    /* 16 MB SGRAM unificada (stub na fase 1) */
+    uint8_t* voodoo;    /* 16 MB SGRAM unificada (device-backed when registered) */
     uint8_t* aureal;    /* 4 KB A3D DSP (stub) */
     uint8_t* periph;    /* 4 KB periféricos (stub) */
     uint8_t* flash;     /* 4 MB flash */
     uint8_t* rom;       /* 256 KB boot ROM */
     bool little_endian;
+
+    int mmio_count;
+    BusMmio mmio[VIPER_MAX_MMIO];
 } Bus;
 
 Bus* bus_create(void);
@@ -51,6 +69,11 @@ bool bus_translate(uint64_t vaddr, uint64_t* phys);
 
 /* Load a file into a memory region (returns 0 on success). */
 int bus_load_file(Bus* bus, const char* path, uint64_t base, uint64_t max_size);
+
+/* Register a device MMIO region (takes precedence over the raw backing
+ * store). Returns 0 on success. */
+int bus_register_mmio(Bus* bus, uint64_t base, uint64_t size, void* ctx,
+                      bus_mmio_read_fn read_fn, bus_mmio_write_fn write_fn);
 
 uint8_t  bus_read8 (Bus* bus, uint64_t vaddr);
 uint16_t bus_read16(Bus* bus, uint64_t vaddr);

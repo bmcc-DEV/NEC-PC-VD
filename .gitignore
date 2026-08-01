@@ -5,6 +5,7 @@ build/
 # PC-Viper build output
 pcviper/build/
 pcviper/pcviper_emulator
+pcviper/voodoo.ppm
 
 # Generated files
 emulator/roms/pcvd_bios.bin

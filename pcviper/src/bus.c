@@ -84,6 +84,27 @@ int bus_load_file(Bus* bus, const char* path, uint64_t base, uint64_t max_size) 
 
 /* ------- physical access dispatch ------- */
 
+static const BusMmio* find_mmio(Bus* bus, uint64_t phys, uint64_t size) {
+    for (int i = 0; i < bus->mmio_count; i++) {
+        const BusMmio* m = &bus->mmio[i];
+        if (phys >= m->base && phys + size <= m->base + m->size)
+            return m;
+    }
+    return NULL;
+}
+
+int bus_register_mmio(Bus* bus, uint64_t base, uint64_t size, void* ctx,
+                      bus_mmio_read_fn read_fn, bus_mmio_write_fn write_fn) {
+    if (bus->mmio_count >= VIPER_MAX_MMIO) return -1;
+    BusMmio* m = &bus->mmio[bus->mmio_count++];
+    m->ctx = ctx;
+    m->base = base;
+    m->size = size;
+    m->read = read_fn;
+    m->write = write_fn;
+    return 0;
+}
+
 static uint8_t* region_ptr(Bus* bus, uint64_t phys, uint64_t size) {
     if (phys + size <= VIPER_RAM_BASE + VIPER_RAM_SIZE)
         return bus->ram + phys - VIPER_RAM_BASE;
@@ -113,6 +134,11 @@ static inline void wr_le(uint8_t* p, int n, uint64_t v) {
 uint8_t bus_read8(Bus* bus, uint64_t vaddr) {
     uint64_t phys;
     if (!bus_translate(vaddr, &phys)) return 0xFF;
+    const BusMmio* m = find_mmio(bus, phys, 1);
+    if (m) {
+        uint32_t v = m->read(m->ctx, phys - m->base);
+        return (uint8_t)((v >> ((phys & 3) * 8)) & 0xFF);
+    }
     uint8_t* p = region_ptr(bus, phys, 1);
     return p ? p[0] : 0xFF;
 }
@@ -120,6 +146,11 @@ uint8_t bus_read8(Bus* bus, uint64_t vaddr) {
 uint16_t bus_read16(Bus* bus, uint64_t vaddr) {
     uint64_t phys;
     if (!bus_translate(vaddr, &phys)) return 0xFFFF;
+    const BusMmio* m = find_mmio(bus, phys, 2);
+    if (m) {
+        uint32_t v = m->read(m->ctx, phys - m->base);
+        return (uint16_t)((v >> ((phys & 2) * 8)) & 0xFFFF);
+    }
     uint8_t* p = region_ptr(bus, phys, 2);
     return p ? (uint16_t)rd_le(p, 2) : 0xFFFF;
 }
@@ -127,6 +158,8 @@ uint16_t bus_read16(Bus* bus, uint64_t vaddr) {
 uint32_t bus_read32(Bus* bus, uint64_t vaddr) {
     uint64_t phys;
     if (!bus_translate(vaddr, &phys)) return 0xFFFFFFFF;
+    const BusMmio* m = find_mmio(bus, phys, 4);
+    if (m) return m->read(m->ctx, phys - m->base);
     uint8_t* p = region_ptr(bus, phys, 4);
     return p ? (uint32_t)rd_le(p, 4) : 0xFFFFFFFF;
 }
@@ -141,6 +174,13 @@ uint64_t bus_read64(Bus* bus, uint64_t vaddr) {
 void bus_write8(Bus* bus, uint64_t vaddr, uint8_t data) {
     uint64_t phys;
     if (!bus_translate(vaddr, &phys)) return;
+    const BusMmio* m = find_mmio(bus, phys, 1);
+    if (m) {
+        uint32_t shift = (phys & 3) * 8;
+        m->write(m->ctx, (phys & ~3ull) - m->base,
+                 (uint32_t)data << shift, 0xFFu << shift);
+        return;
+    }
     uint8_t* p = region_ptr(bus, phys, 1);
     if (p) p[0] = data;
 }
@@ -148,6 +188,13 @@ void bus_write8(Bus* bus, uint64_t vaddr, uint8_t data) {
 void bus_write16(Bus* bus, uint64_t vaddr, uint16_t data) {
     uint64_t phys;
     if (!bus_translate(vaddr, &phys)) return;
+    const BusMmio* m = find_mmio(bus, phys, 2);
+    if (m) {
+        uint32_t shift = (phys & 2) * 8;
+        m->write(m->ctx, (phys & ~3ull) - m->base,
+                 (uint32_t)data << shift, 0xFFFFu << shift);
+        return;
+    }
     uint8_t* p = region_ptr(bus, phys, 2);
     if (p) wr_le(p, 2, data);
 }
@@ -155,6 +202,11 @@ void bus_write16(Bus* bus, uint64_t vaddr, uint16_t data) {
 void bus_write32(Bus* bus, uint64_t vaddr, uint32_t data) {
     uint64_t phys;
     if (!bus_translate(vaddr, &phys)) return;
+    const BusMmio* m = find_mmio(bus, phys, 4);
+    if (m) {
+        m->write(m->ctx, phys - m->base, data, 0xFFFFFFFF);
+        return;
+    }
     uint8_t* p = region_ptr(bus, phys, 4);
     if (p) wr_le(p, 4, data);
 }
