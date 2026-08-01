@@ -242,33 +242,64 @@ static void a3d_demo(AurealA3D* a, Bus* bus) {
            AUREAL_CHANNELS, AUREAL_RATE);
 
     write_wav("aureal.wav", mix, frames);
-
-#ifdef HAVE_SDL2
-    if (SDL_Init(SDL_INIT_AUDIO) == 0) {
-        SDL_AudioSpec want;
-        memset(&want, 0, sizeof(want));
-        want.freq = AUREAL_RATE;
-        want.format = AUDIO_S16SYS;
-        want.channels = 2;
-        want.samples = 1024;
-        SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
-        if (dev) {
-            SDL_QueueAudio(dev, mix, (uint32_t)frames * 4);
-            SDL_PauseAudioDevice(dev, 0);
-            SDL_Delay((uint32_t)seconds * 1000);
-            SDL_CloseAudioDevice(dev);
-            SDL_Quit();
-            printf("pcviper: played %d s of A3D audio via SDL2\n", seconds);
-        } else {
-            SDL_Quit();
-        }
-    }
-#endif
     free(mix);
 }
 
-/* ---- advanced Voodoo2 EC demo: Gouraud + fog, alpha blend,
- *      multitexture (diffuse * lightmap), mipmap/trilinear ---- */
+/* Loads the audio buffer that firmware/demo3d.c wrote at the end of
+ * voodoo_setup() and verifies A3D 3D-positioning: at -45 deg azimuth the
+ * left channel should dominate, at +45 deg the right. */
+static void a3d_demo3d_audio(AurealA3D* a, Bus* bus) {
+    /* sample the sine wave that demo3d.c generated at physical 0x00100000 */
+    int n_samples = 0;
+    for (int i = 0; i < 2400; i++) {
+        int16_t s = (int16_t)bus_read16(bus, 0x00100000u + (uint64_t)i * 2);
+        if (s != 0) n_samples++;
+    }
+    if (n_samples == 0) return;     /* firmware never wrote the audio buffer */
+
+    int base = A3D_CHAN_BASE;
+    aureal_reg_write(a, base + A3D_CH_SRC, 0x00100000u);
+    aureal_reg_write(a, base + A3D_CH_LEN, 2400u);
+    aureal_reg_write(a, base + A3D_CH_PITCH, 0x10000u);
+    aureal_reg_write(a, base + A3D_CH_VOL_L, 0xFFFFu);
+    aureal_reg_write(a, base + A3D_CH_VOL_R, 0xFFFFu);
+    aureal_reg_write(a, base + A3D_CH_ELEVATION, 0);
+
+    /* Render twice with two opposite azimuths, measure stereo balance. */
+    int seconds = 1;
+    int frames = AUREAL_RATE * seconds;
+    float az[2] = { -45.0f, 45.0f };
+    const char* labels[2] = { "az=-45", "az=+45" };
+    int ok = 1;
+    for (int k = 0; k < 2; k++) {
+        /* reset state by stopping and re-enabling */
+        aureal_reg_write(a, base + A3D_CH_CTRL, 0);
+        uint32_t azb;
+        memcpy(&azb, &az[k], 4);
+        aureal_reg_write(a, base + A3D_CH_AZIMUTH, azb);
+        aureal_reg_write(a, base + A3D_CH_CTRL, 3u);
+
+        int16_t* mix = malloc((size_t)frames * 4);
+        if (!mix) return;
+        aureal_render(a, mix, frames);
+
+        double rms_l = 0.0, rms_r = 0.0;
+        for (int i = 0; i < frames; i++) {
+            rms_l += (double)mix[2 * i] * mix[2 * i];
+            rms_r += (double)mix[2 * i + 1] * mix[2 * i + 1];
+        }
+        rms_l = sqrt(rms_l / frames);
+        rms_r = sqrt(rms_r / frames);
+        const char* which = (k == 0 && rms_l > rms_r * 1.1f) ? "left" :
+                            (k == 1 && rms_r > rms_l * 1.1f) ? "right" : "bal";
+        printf("pcviper: demo3d a3d %s L RMS=%.0f R RMS=%.0f -> %s\n",
+               labels[k], rms_l, rms_r, which);
+        if (!strcmp("bal", which)) ok = 0;
+        free(mix);
+    }
+    printf("pcviper: %s\n", ok ? "demo3d 3D positional audio OK"
+                               : "demo3d 3D positional audio: unexpected balance");
+}
 
 static uint32_t v2_fbits(float v) {
     uint32_t b;
@@ -598,16 +629,17 @@ typedef struct {
     float cx, sx;      /* cos/sin of pitch */
     float camz;        /* camera distance (zoom) */
     float tx, ty;      /* screen-space translation (pixels) */
+    float azimuth;     /* sound source azimuth in degrees */
     uint32_t magic;
 } ViperInput;
 
 static void viper_input_write(Bus* bus, const ViperInput* in) {
     const uint32_t* w = (const uint32_t*)in;
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 9; i++)   /* 8 floats + 1 uint32 = 9 dwords */
         bus_write32(bus, VIPER_INPUT_ADDR + (uint64_t)i * 4, w[i]);
 }
 
-/* Headless override: PCVIPER_INPUT_YAW/PITCH/CAMZ/TX/TY (env) writes the
+/* Headless override: PCVIPER_INPUT_YAW/PITCH/CAMZ/TX/TY/AZIMUTH (env) writes the
  * input block so non-interactive runs (and validate.sh) can exercise the
  * same host->firmware path used by the SDL2 interactive demo. */
 static int viper_input_from_env(Bus* bus) {
@@ -616,12 +648,14 @@ static int viper_input_from_env(Bus* bus) {
     const char* camz = getenv("PCVIPER_INPUT_CAMZ");
     const char* tx = getenv("PCVIPER_INPUT_TX");
     const char* ty = getenv("PCVIPER_INPUT_TY");
-    if (!yaw && !pitch && !camz && !tx && !ty) return 0;
+    const char* azimuth = getenv("PCVIPER_INPUT_AZIMUTH");
+    if (!yaw && !pitch && !camz && !tx && !ty && !azimuth) return 0;
     ViperInput in;
     in.magic = VIPER_INPUT_MAGIC;
     in.cy = 0.9396926f; in.sy = 0.3420201f;   /* default yaw 20 deg */
     in.cx = 1.0f; in.sx = 0.0f;
     in.camz = 3.0f; in.tx = 0.0f; in.ty = 0.0f;
+    in.azimuth = 0.0f;
     if (yaw) {
         in.cy = cosf(strtof(yaw, NULL) * M_PI / 180.0f);
         in.sy = sinf(strtof(yaw, NULL) * M_PI / 180.0f);
@@ -633,6 +667,7 @@ static int viper_input_from_env(Bus* bus) {
     if (camz) in.camz = strtof(camz, NULL);
     if (tx) in.tx = strtof(tx, NULL);
     if (ty) in.ty = strtof(ty, NULL);
+    if (azimuth) in.azimuth = strtof(azimuth, NULL);
     viper_input_write(bus, &in);
     return 1;
 }
@@ -678,6 +713,7 @@ static int interactive_demo(Bus* bus, Vr5432* cpu, Voodoo2EC* voodoo) {
     in.cy = 0.9396926f; in.sy = 0.3420201f;
     in.cx = 1.0f; in.sx = 0.0f;
     in.camz = 3.0f; in.tx = 0.0f; in.ty = 0.0f;
+    in.azimuth = 0.0f;
     in.magic = VIPER_INPUT_MAGIC;
     viper_input_write(bus, &in);
 
@@ -686,6 +722,7 @@ static int interactive_demo(Bus* bus, Vr5432* cpu, Voodoo2EC* voodoo) {
 
     float yaw_deg = 20.0f, pitch_deg = 0.0f;
     float camz = 3.0f, tx = 0.0f, ty = 0.0f;
+    float azimuth = 0.0f;  /* sound source orbits around camera */
 
     /* optional auto-quit for headless/CI smoke tests */
     long auto_frames = 0;
@@ -716,6 +753,7 @@ static int interactive_demo(Bus* bus, Vr5432* cpu, Voodoo2EC* voodoo) {
         const Uint8* k = SDL_GetKeyboardState(NULL);
         float dyaw = 0.0f, dpitch = 0.0f;
         float dtx = 0.0f, dty = 0.0f, dcam = 0.0f;
+        float daz = 0.0f;
         if (k[SDL_SCANCODE_LEFT])  dyaw   += 1.5f;
         if (k[SDL_SCANCODE_RIGHT]) dyaw   -= 1.5f;
         if (k[SDL_SCANCODE_UP])    dpitch += 1.5f;
@@ -726,6 +764,8 @@ static int interactive_demo(Bus* bus, Vr5432* cpu, Voodoo2EC* voodoo) {
         if (k[SDL_SCANCODE_S])     dty    += 3.0f;
         if (k[SDL_SCANCODE_Z] || k[SDL_SCANCODE_EQUALS]) dcam += 0.05f;
         if (k[SDL_SCANCODE_X] || k[SDL_SCANCODE_MINUS])  dcam -= 0.05f;
+        if (k[SDL_SCANCODE_Q])     daz    -= 2.0f;  /* azimuth CCW */
+        if (k[SDL_SCANCODE_E])     daz    += 2.0f;  /* azimuth CW */
 
         if (pad) {
             Sint16 lx = SDL_GameControllerGetAxis(
@@ -748,6 +788,10 @@ static int interactive_demo(Bus* bus, Vr5432* cpu, Voodoo2EC* voodoo) {
                     pad, SDL_CONTROLLER_BUTTON_DPAD_UP)) dty -= 3.0f;
             if (SDL_GameControllerGetButton(
                     pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN)) dty += 3.0f;
+            if (SDL_GameControllerGetButton(
+                    pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) daz -= 2.0f;
+            if (SDL_GameControllerGetButton(
+                    pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) daz += 2.0f;
         }
 
         yaw_deg += dyaw;
@@ -762,12 +806,16 @@ static int interactive_demo(Bus* bus, Vr5432* cpu, Voodoo2EC* voodoo) {
         if (tx < -640.0f) tx = -640.0f;
         if (ty > 480.0f) ty = 480.0f;
         if (ty < -480.0f) ty = -480.0f;
+        azimuth += daz;
+        if (azimuth > 180.0f) azimuth -= 360.0f;
+        if (azimuth < -180.0f) azimuth += 360.0f;
 
         in.cy = cosf(yaw_deg * M_PI / 180.0f);
         in.sy = sinf(yaw_deg * M_PI / 180.0f);
         in.cx = cosf(pitch_deg * M_PI / 180.0f);
         in.sx = sinf(pitch_deg * M_PI / 180.0f);
         in.camz = camz; in.tx = tx; in.ty = ty;
+        in.azimuth = azimuth;
         viper_input_write(bus, &in);
 
         /* run one frame's worth of the demo firmware; it re-reads the
@@ -820,7 +868,7 @@ int main(int argc, char** argv) {
 
     /* args: [rom.bin [cycles]] [--sdl|-i] [--cycles N] */
     const char* rom = NULL;
-    uint64_t run_cycles = 100000;   /* covers a full demo3d frame (~43k) */
+    uint64_t run_cycles = 600000;   /* covers demo3d boot (~500k + a render frame) */
     int interactive = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--sdl") == 0 || strcmp(argv[i], "-i") == 0) {
@@ -910,6 +958,8 @@ int main(int argc, char** argv) {
     voodoo_advanced_demo(voodoo);
     soc_demo(soc, bus);
     a3d_demo(audio, bus);
+    if (argc > 1)
+        a3d_demo3d_audio(audio, bus);
 
     bus_destroy(bus);
     voodoo2ec_destroy(voodoo);

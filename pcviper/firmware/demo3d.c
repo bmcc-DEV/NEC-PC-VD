@@ -27,6 +27,9 @@
 
 typedef unsigned int   uint32_t;
 typedef unsigned short uint16_t;
+typedef unsigned char  uint8_t;
+typedef signed short   int16_t;
+typedef signed int     int32_t;
 
 /* ---- MMIO access to the Voodoo2 EC registers ----
  * V2_R(r) writes register dword index r (r is DWORD, not byte).
@@ -59,17 +62,53 @@ typedef unsigned short uint16_t;
 #define SX 640
 #define SY 480
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
+/* sinf approximation using Taylor series (enough for audio generation) */
+static inline float sinf_fast(float x) {
+    float x2 = x * x;
+    float x3 = x2 * x;
+    float x5 = x3 * x2;
+    return x - x3 / 6.0f + x5 / 120.0f;
+}
+
+/* sinf wrapper that reduces argument to [-pi, pi] */
+static inline float my_sinf(float x) {
+    float cycles = x / (2.0f * M_PI);
+    if (cycles >= 0.0f) cycles = (int)(cycles + 0.5f);
+    else cycles = (int)(cycles - 0.5f);
+    x -= cycles * 2.0f * M_PI;
+    return sinf_fast(x);
+}
+
 /* ---- host-written input block (physical 0x00000800, KSEG0) ---- */
 typedef struct {
     float cy, sy;      /* cos/sin of yaw */
     float cx, sx;      /* cos/sin of pitch */
     float camz;        /* camera distance (zoom) */
     float tx, ty;      /* screen translation */
+    float azimuth;     /* sound source azimuth in degrees (-180..180) */
     uint32_t magic;    /* VIPER_INPUT_MAGIC when valid */
 } ViperInput;
 
 #define VIPER_INPUT       ((volatile ViperInput*)0x80000800ull)
 #define VIPER_INPUT_MAGIC 0xA3D2EC01u
+
+/* ---- A3D MMIO access (physical 0x14000000 -> KSEG1 0xB4000000) ---- */
+#define A3D_R(r)   (*(volatile uint32_t*)(0xB4000000ull + ((uint32_t)(r) << 2)))
+
+/* A3D register dword indices (from aureal_a3d.h) */
+#define A3D_CH0_CTRL      0x40/4      /* 16 */
+#define A3D_CH0_PITCH     0x44/4      /* 17 */
+#define A3D_CH0_SRC       0x48/4      /* 18 */
+#define A3D_CH0_LEN       0x4C/4      /* 19 */
+#define A3D_CH0_VOL_L     0x54/4      /* 21 */
+#define A3D_CH0_VOL_R     0x58/4      /* 22 */
+#define A3D_CH0_AZIMUTH   0x68/4      /* 26 */
+#define A3D_CH0_ELEVATION 0x6C/4      /* 27 */
+#define A3D_CH0_REVERB    0x70/4      /* 28 */
 
 static inline uint32_t fbits(float f) {
     union { float f; uint32_t u; } c; c.f = f; return c.u;
@@ -107,6 +146,24 @@ static void voodoo_setup(void) {
         uint16_t c1 = ((x1 >> 3) + (y0 >> 3)) & 1 ? 0x7FFF : 0x0000;
         V2_TEX(0x300000u + (uint32_t)i * 2) = c0 | ((uint32_t)c1 << 16);
     }
+
+    /* ---- A3D channel 0 setup ----
+     * Generate a simple sine wave in RAM at 0x00100000 for the sound source.
+     * 2400 samples = 50 ms @ 48 kHz; firm-fitting within the ~2M cycle budget. */
+    const uint32_t audio_src = 0x00100000u;
+    const uint32_t audio_len = 2400u;
+    for (uint32_t i = 0; i < audio_len; i++) {
+        int16_t s = (int16_t)(my_sinf(2.0f * M_PI * 440.0f * i / 48000.0f) * 16000.0f);
+        *(volatile uint16_t*)(0xA0100000ull + i * 2) = (uint16_t)s;
+    }
+    A3D_R(A3D_CH0_SRC)  = audio_src;
+    A3D_R(A3D_CH0_LEN)  = audio_len;
+    A3D_R(A3D_CH0_PITCH) = 0x10000u;     /* 1.0 (16.16) */
+    A3D_R(A3D_CH0_VOL_L) = 0xFFFFu;      /* 1.0 */
+    A3D_R(A3D_CH0_VOL_R) = 0xFFFFu;
+    A3D_R(A3D_CH0_ELEVATION) = 0;        /* flat */
+    A3D_R(A3D_CH0_REVERB) = 0x2000u;     /* some reverb */
+    A3D_R(A3D_CH0_CTRL) = 3u;            /* enable + loop */
 }
 
 static void put_vertex(float sx, float sy, float s, float t, float w) {
@@ -157,6 +214,7 @@ void main_c(void) {
     float cy = 0.9396926f, sy = 0.3420201f;
     float cx = 1.0f, sx = 0.0f;
     float camz = 3.0f, tx = 0.0f, ty = 0.0f;
+    float azimuth = 0.0f;
 
     voodoo_setup();
     while (1) {
@@ -165,7 +223,10 @@ void main_c(void) {
             cy = in->cy; sy = in->sy;
             cx = in->cx; sx = in->sx;
             camz = in->camz; tx = in->tx; ty = in->ty;
+            azimuth = in->azimuth;
         }
+        A3D_R(A3D_CH0_AZIMUTH) = fbits(azimuth);
+        
         V2_R(R_COLOR1) = 0x00000000u;
         V2_R(R_FASTFILL) = 1;
         V2_R(R_SETUPMODE) = 0x31u;
