@@ -18,7 +18,7 @@ add_executable(nec-pc-vd
     src/bus/pci_bus.cpp
     src/frontend/sdl_window.cpp
     src/frontend/opengl_output.cpp
-    src/voodoo/voodoo_rush.cpp
+    src/voodoo/voodoo2.cpp
     src/voodoo/voodoo_fifo.cpp
     src/voodoo/tmu.cpp
 )

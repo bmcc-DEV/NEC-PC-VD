@@ -1,57 +1,39 @@
 #pragma once
 #include <cstdint>
 #include <array>
-#include "voodoo_defs.h"
 
 namespace voodoo {
 
 struct TexelFormat {
-    uint32_t rgb332[256];
-    uint32_t alpha8[256];
-    uint32_t int8[256];
-    uint32_t ai44[256];
-    uint32_t rgb565[65536];
-    uint32_t argb1555[65536];
-    uint32_t argb4444[65536];
+    std::array<uint32_t, 256>    rgb332;
+    std::array<uint32_t, 256>    alpha8;
+    std::array<uint32_t, 256>    int8;
+    std::array<uint32_t, 256>    ai44;
+    std::array<uint32_t, 65536>  rgb565;
+    std::array<uint32_t, 65536>  argb1555;
+    std::array<uint32_t, 65536>  argb4444;
 
     TexelFormat();
-    uint32_t lookup8(int fmt, uint8_t val) const;
-    uint32_t lookup16(int fmt, uint16_t val) const;
 };
 
+// Texture unit: owns the TMU RAM and performs texel lookups for a single TMU.
 class TMU {
 public:
     TMU();
-    void init(int index, uint8_t* ram, uint32_t size);
+
+    void init(uint8_t* ram, uint32_t size);
     void reset();
+    bool has_ram() const { return m_ram != nullptr; }
 
-    void write_reg(int regnum, uint32_t data);
-    uint32_t read_reg(int regnum) const;
-    uint32_t read_palette(int index) const;
-    void write_palette(int index, uint32_t data);
-    void write_texture(uint32_t offset, uint32_t data);
-
-    void mark_dirty() { m_dirty = true; }
-    bool is_dirty() const { return m_dirty; }
-    void clear_dirty() { m_dirty = false; }
-
-    // Texture configuration
-    uint32_t texel_lookup(uint32_t s, uint32_t t, int lod) const;
+    // Fetch a texel for the given format, s/t coordinates and texture base.
+    // s/t are fixed-point 14.18 values scaled to the texture dimensions.
+    uint32_t texel_lookup(uint32_t fmt, int lod, uint32_t s, uint32_t t, uint32_t texbase) const;
 
 private:
-    int m_index = 0;
     uint8_t* m_ram = nullptr;
     uint32_t m_mask = 0;
-    bool m_dirty = true;
 
-    std::array<uint32_t, 512/4> m_regs;
-    std::array<uint32_t, 512> m_palette;
-
-
-
-    // LOD settings
-    uint32_t lod_base(int lod) const;
-    uint32_t lod_size(int lod) const;
+    static const TexelFormat& tables();
 };
 
 } // namespace voodoo

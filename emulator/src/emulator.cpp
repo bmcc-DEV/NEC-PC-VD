@@ -25,6 +25,7 @@ bool Emulator::init(const char* rom_path) {
     m_mediagx.set_ram(m_ram, m_ram_size);
     m_voodoo.set_memory(&m_mem);
     m_voodoo.reset();
+    m_pci.register_device(0, 1, 0, &m_voodoo);
     setup_memory_map();
     setup_io_handlers();
 
@@ -91,6 +92,14 @@ void Emulator::setup_memory_map() {
 
     // 2D framebuffer at 0x40800000 (4MB)
     m_mem.add_region(0x40800000, 0x40BFFFFF, m_ram + 0x800000, false);
+
+    // Voodoo 2 MMIO at 0x42000000 (4MB aperture)
+    m_mem.add_read_handler(0x42000000, 0x43FFFFFF, [this](uint32_t addr) -> uint32_t {
+        return m_voodoo.read(addr - 0x42000000);
+    });
+    m_mem.add_write_handler(0x42000000, 0x43FFFFFF, [this](uint32_t addr, uint32_t data, uint32_t mask) {
+        m_voodoo.write(addr - 0x42000000, data, mask);
+    });
 
     // BIOS shadow at 0xC0000 (real-mode accessible)
     m_mem.add_region(0x000C0000, 0x000FFFFF, m_ram + 0xC0000, false);

@@ -9,3 +9,9 @@ emulator/roms/test_code.bin
 # Object files
 *.o
 *.obj
+
+# Reference material / external sources
+Docs/
+FIFO/
+MaMe Files/
+qemu-3dfx/

@@ -6,7 +6,7 @@
 #include "bus/memory_bus.h"
 #include "bus/pci_bus.h"
 #include "frontend/sdl_window.h"
-#include "voodoo/voodoo_rush.h"
+#include "voodoo/voodoo2.h"
 
 class Emulator {
 public:
@@ -22,7 +22,7 @@ private:
     PciBus m_pci;
     I386Core m_cpu;
     MediagxSoC m_mediagx;
-    voodoo::VoodooRushDevice m_voodoo;
+    voodoo::Voodoo2Device m_voodoo;
     SdlWindow m_window;
 
     uint8_t* m_ram = nullptr;

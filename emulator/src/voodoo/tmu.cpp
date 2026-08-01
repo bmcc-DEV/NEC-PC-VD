@@ -1,10 +1,6 @@
 #include "tmu.h"
-#include <cstring>
-#include <algorithm>
 
 namespace voodoo {
-
-static TexelFormat s_texel;  // file-scope texel format tables
 
 // Expand color components from N bits to 8 bits
 static inline uint8_t expand_n(uint32_t v, int n) {
@@ -65,114 +61,67 @@ TexelFormat::TexelFormat() {
     }
 }
 
-uint32_t TexelFormat::lookup8(int fmt, uint8_t val) const {
-    switch (fmt) {
-    case 0: case 8: return rgb332[val];
-    case 2: return alpha8[val];
-    case 3: return int8[val];
-    case 4: return ai44[val];
-    default: return 0xFF000000;
-    }
-}
+TMU::TMU() = default;
 
-uint32_t TexelFormat::lookup16(int fmt, uint16_t val) const {
-    switch (fmt) {
-    case 10: return rgb565[val];
-    case 11: return argb1555[val];
-    case 12: return argb4444[val];
-    default: return 0xFF000000;
-    }
-}
-
-// TMU implementation
-TMU::TMU() {
-    m_regs.fill(0);
-    m_palette.fill(0);
-}
-
-void TMU::init(int index, uint8_t* ram, uint32_t size) {
-    m_index = index;
+void TMU::init(uint8_t* ram, uint32_t size) {
     m_ram = ram;
     m_mask = size - 1;
-    reset();
 }
 
 void TMU::reset() {
-    m_regs.fill(0);
-    m_palette.fill(0);
-    m_dirty = true;
 }
 
-void TMU::write_reg(int regnum, uint32_t data) {
-    if (regnum >= m_regs.size()) return;
-    if (m_regs[regnum] != data) {
-        m_regs[regnum] = data;
-        m_dirty = true;
-    }
-    // Special: NCC/palette writes
-    if (regnum >= reg_nccTable/4 && regnum < reg_nccTable/4 + 48) {
-        m_palette[regnum - reg_nccTable/4] = data;
-    }
+const TexelFormat& TMU::tables() {
+    static TexelFormat fmt;
+    return fmt;
 }
 
-uint32_t TMU::read_reg(int regnum) const {
-    if (regnum < m_regs.size()) return m_regs[regnum];
-    return 0;
-}
-
-void TMU::write_texture(uint32_t offset, uint32_t data) {
-    if (!m_ram) return;
-    int lod = (offset >> 15) & 0xF;
-    int tt = (offset >> 7) & 0xFF;
-    int ts = (offset << 1) & 0xFF;
-
-    // Simple linear address calculation
-    uint32_t addr = (lod << 16) | (tt << 8) | ts;
-    addr &= m_mask;
-
-    // Write 4 bytes (little-endian)
-    m_ram[addr + 0] = (data >> 0) & 0xFF;
-    m_ram[addr + 1] = (data >> 8) & 0xFF;
-    m_ram[addr + 2] = (data >> 16) & 0xFF;
-    m_ram[addr + 3] = (data >> 24) & 0xFF;
-}
-
-uint32_t TMU::lod_base(int lod) const {
-    // Simplified LOD base from textureLOD register
-    uint32_t texlod = m_regs[reg_textureLOD/4];
-    return (texlod >> (lod * 4)) & 0xF;
-}
-
-uint32_t TMU::lod_size(int lod) const {
-    (void)lod;
-    return 256;  // Simplified: fixed 256-byte LOD
-}
-
-uint32_t TMU::texel_lookup(uint32_t s, uint32_t t, int lod) const {
+uint32_t TMU::texel_lookup(uint32_t fmt, int lod, uint32_t s, uint32_t t, uint32_t texbase) const {
     if (!m_ram) return 0xFF000000;
 
-    uint32_t texmode = m_regs[reg_textureMode/4];
-    int fmt = texmode & 0xF;
+    // Texture dimensions are 2^lod texels per side; the base holds the byte
+    // address of LOD 0. Coordinates wrap within the current LOD.
+    uint32_t size = 1u << lod;
+    uint32_t sm = s & (size - 1);
+    uint32_t tm = t & (size - 1);
 
-    // Calculate texel address (simplified - no LOD, no bilinear)
-    uint32_t addr = (t & 0xFF) * 256 + (s & 0xFF);
-    if (fmt < 8) {
-        // 8-bit texel
-        uint8_t val = m_ram[addr & m_mask];
-        return s_texel.lookup8(fmt, val);
-    } else {
-        uint16_t val = m_ram[(addr * 2) & m_mask] | (m_ram[(addr * 2 + 1) & m_mask] << 8);
-        return s_texel.lookup16(fmt, val);
+    // texbase is a byte offset in TMU RAM; each LOD lives at lod*size*size
+    // texels after the base (mipmap chain).
+    uint32_t texel = sm + tm * size;
+    uint32_t bpp = 1;
+    switch (fmt) {
+    case 0: case 1: case 2: case 3: bpp = 1; break;              // 8-bit formats
+    case 4: case 5: case 7: bpp = 2; break;                      // 16-bit formats
+    default: bpp = 4; break;                                     // 24/32-bit formats
     }
-}
 
-void TMU::write_palette(int index, uint32_t data) {
-    if (index < 512) m_palette[index] = data;
-}
-
-uint32_t TMU::read_palette(int index) const {
-    if (index < 512) return m_palette[index];
-    return 0;
+    uint32_t addr = (texbase + texel * bpp) & m_mask;
+    switch (fmt) {
+    case 0: return tables().rgb332[m_ram[addr]];
+    case 1: return tables().alpha8[m_ram[addr]];
+    case 2: return tables().int8[m_ram[addr]];
+    case 3: return tables().ai44[m_ram[addr]];
+    case 4: {
+        uint16_t v = m_ram[addr] | (m_ram[(addr + 1) & m_mask] << 8);
+        return tables().rgb565[v];
+    }
+    case 5: {
+        uint16_t v = m_ram[addr] | (m_ram[(addr + 1) & m_mask] << 8);
+        return tables().argb1555[v];
+    }
+    case 7: {
+        uint16_t v = m_ram[addr] | (m_ram[(addr + 1) & m_mask] << 8);
+        return tables().argb4444[v];
+    }
+    case 6: {
+        // ARGB8888
+        return m_ram[addr]
+            | (m_ram[(addr + 1) & m_mask] << 8)
+            | (m_ram[(addr + 2) & m_mask] << 16)
+            | (m_ram[(addr + 3) & m_mask] << 24);
+    }
+    default: return 0xFF000000;
+    }
 }
 
 } // namespace voodoo
