@@ -423,14 +423,14 @@ static void classify_insn(uint32_t insn, InsnInfo* ii) {
     case 0x1A: case 0x1B:
     case 0x20: case 0x21: case 0x22: case 0x23:
     case 0x24: case 0x25: case 0x26: case 0x27:
-    case 0x30: case 0x36:                         /* loads */
+    case 0x30: case 0x37:                         /* loads (LD=0x37 R4300) */
         ii->latency = 2;
         ii->dest_kind = K_GPR; ii->dest_reg = rt;
         ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
         break;
     case 0x28: case 0x29: case 0x2A: case 0x2B:
     case 0x2C: case 0x2D: case 0x2E: case 0x2F:
-    case 0x37: case 0x3D:                         /* stores */
+    case 0x38: case 0x3F:                         /* stores (SC=0x38, SD=0x3F R4300) */
         ii->structural = true;
         ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
         if (op != 0x2F) { ii->src_kind[1] = K_GPR; ii->src_reg[1] = rt; ii->nsrc = 2; }
@@ -440,12 +440,12 @@ static void classify_insn(uint32_t insn, InsnInfo* ii) {
         ii->dest_kind = K_FPR; ii->dest_reg = rt;
         ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
         break;
-    case 0x34:                                    /* LDC1 */
+    case 0x35:                                    /* LDC1 (R4300) */
         ii->pipe = PIPE_FPU; ii->latency = 3;
         ii->dest_kind = K_FPR; ii->dest_reg = rt; ii->dest_wide = true;
         ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs; ii->nsrc = 1;
         break;
-    case 0x38: case 0x3B:                         /* SWC1/SDC1 */
+    case 0x39: case 0x3D:                         /* SWC1/SDC1 (R4300) */
         ii->structural = true;
         ii->src_kind[0] = K_GPR; ii->src_reg[0] = rs;
         ii->src_kind[1] = K_FPR; ii->src_reg[1] = rt; ii->nsrc = 2;
@@ -957,7 +957,7 @@ static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay
         c->llbit = 1;
         c->cp0[CP0_LLADDR] = addr;
         break;
-    case 0x36: /* LD */
+    case 0x37: /* LD (R4300 encoding) */
         addr = c->gpr[rs] + (uint64_t)se16(insn);
         if (addr_err_check(c, addr, 8, EXC_ADEL, was_delay, inst_addr)) break;
         set_gpr(c, rt, bus_read64(c->bus, addr));
@@ -995,7 +995,7 @@ static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay
         bus_write32(c->bus, addr & ~3ull, mips_swr(c, addr, (uint32_t)c->gpr[rt]));
         break; }
     case 0x2F: /* CACHE */ break;
-    case 0x37: /* SC */
+    case 0x38: /* SC (R4300 encoding) */
         addr = c->gpr[rs] + (uint64_t)se16(insn);
         if (addr_err_check(c, addr, 4, EXC_ADES, was_delay, inst_addr)) break;
         if (c->llbit) {
@@ -1006,7 +1006,7 @@ static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay
         }
         c->llbit = 0;
         break;
-    case 0x3D: /* SD */
+    case 0x3F: /* SD (R4300 encoding) */
         addr = c->gpr[rs] + (uint64_t)se16(insn);
         if (addr_err_check(c, addr, 8, EXC_ADES, was_delay, inst_addr)) break;
         bus_write64(c->bus, addr, c->gpr[rt]);
@@ -1273,18 +1273,18 @@ static void execute(Vr5432* c, uint32_t insn, uint64_t inst_addr, bool was_delay
         if (addr_err_check(c, addr, 4, EXC_ADEL, was_delay, inst_addr)) break;
         c->fpr[rt] = bus_read32(c->bus, addr);
         break;
-    case 0x34: /* LDC1 */
+    case 0x35: /* LDC1 (R4300 encoding) */
         addr = c->gpr[rs] + (uint64_t)se16(insn);
         if (addr_err_check(c, addr, 8, EXC_ADEL, was_delay, inst_addr)) break;
         c->fpr[rt] = (uint32_t)bus_read64(c->bus, addr);
         c->fpr[rt + 1] = (uint32_t)(bus_read64(c->bus, addr) >> 32);
         break;
-    case 0x38: /* SWC1 */
+    case 0x39: /* SWC1 (R4300 encoding) */
         addr = c->gpr[rs] + (uint64_t)se16(insn);
         if (addr_err_check(c, addr, 4, EXC_ADES, was_delay, inst_addr)) break;
         bus_write32(c->bus, addr, c->fpr[rt]);
         break;
-    case 0x3B: /* SDC1 */
+    case 0x3D: /* SDC1 (R4300 encoding) */
         addr = c->gpr[rs] + (uint64_t)se16(insn);
         if (addr_err_check(c, addr, 8, EXC_ADES, was_delay, inst_addr)) break;
         bus_write64(c->bus, addr, (uint64_t)c->fpr[rt] |

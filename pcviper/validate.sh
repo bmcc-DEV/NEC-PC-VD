@@ -30,10 +30,31 @@ done
 echo "  total: $total_pass PASS / $total_fail FAIL"
 [ "$total_fail" -eq 0 ] || { echo "TESTS: FAILURES"; exit 1; }
 
+echo "[2b] POST firmware (MIPS IV assembly)"
+FW=""
+if command -v mips64-elf-as >/dev/null 2>&1 || [ -x /opt/libdragon/mips64-elf/bin/as ]; then
+    AS="${AS:-/opt/libdragon/mips64-elf/bin/as}"
+    LD="${LD:-/opt/libdragon/mips64-elf/bin/ld}"
+    OBJCOPY="${OBJCOPY:-/opt/libdragon/mips64-elf/bin/objcopy}"
+    cd firmware
+    "$AS" -EL -mips4 -o firmware.o firmware.S \
+        && "$LD" -EL -T link.ld -o firmware.elf firmware.o \
+        && "$OBJCOPY" -O binary firmware.elf pcviper_boot.bin
+    cd ..
+    if [ -s firmware/pcviper_boot.bin ]; then
+        FW="firmware/pcviper_boot.bin"
+        echo "  firmware built ($(stat -c%s firmware/pcviper_boot.bin) bytes)"
+    else
+        echo "  WARNING: firmware build failed, using built-in boot"
+    fi
+else
+    echo "  WARNING: no mips64 cross-toolchain, using built-in boot"
+fi
+
 echo "[3/4] Emulator run (all subsystems)"
 rm -f voodoo.ppm glide.ppm aureal.wav
-SDL_AUDIODRIVER=dummy timeout 20 ./pcviper_emulator 2>&1 \
-    | grep -E "CPU -> MMIO OK|CPU->SoC DMA|CPU->A3D channel regs|CPU->A3D audio|multitexture OK|glide textured|soc DMA DVD|memcard slot0|played|wrote aureal"
+SDL_AUDIODRIVER=dummy timeout 20 ./pcviper_emulator $FW 2>&1 \
+    | grep -E "CPU -> MMIO OK|CPU->SoC DMA|CPU->A3D channel regs|CPU->A3D audio|POST code|multitexture OK|glide textured|soc DMA DVD|memcard slot0|played|wrote aureal"
 echo "  emulator exit: $?"
 
 echo "[4/4] Artifact checks"

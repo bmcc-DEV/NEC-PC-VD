@@ -472,6 +472,11 @@ int main(int argc, char** argv) {
            (color1 == 0x00FF0000u) ? "CPU -> MMIO OK (0xB0000148)"
                                    : "CPU -> MMIO: unexpected value");
 
+    uint32_t post = bus_read32(bus, 0x0000F000ull);
+    printf("pcviper: firmware POST code = 0x%08X %s\n", post,
+           (post == 0xA3D200FFu) ? "READY (all CPU/FPU/MMIO self-tests OK)"
+                                 : "(incomplete)");
+
     cpu_driven_validate(bus, audio, soc);
 
     voodoo_demo(voodoo);

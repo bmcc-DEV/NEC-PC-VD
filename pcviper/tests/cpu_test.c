@@ -98,8 +98,8 @@ int main(void) {
             itype(0x19, 8, 8, 0x20),                /* daddiu $8, $8, 0x20 */
             itype(0x0F, 0, 9, 0xDEAD),              /* lui  $9, 0xDEAD */
             itype(0x0D, 9, 9, 0xBEEF),              /* ori  $9, $9, 0xBEEF */
-            itype(0x3D, 8, 9, 0),                   /* sd   $9, 0($8) */
-            itype(0x36, 8, 10, 0),                  /* ld   $10, 0($8) */
+            itype(0x3F, 8, 9, 0),                   /* sd   $9, 0($8) (R4300: 0x3F) */
+            itype(0x37, 8, 10, 0),                  /* ld   $10, 0($8) (R4300: 0x37) */
         };
         load_prog(p, 6);
         step_n(6);
@@ -276,7 +276,7 @@ int main(void) {
             itype(0x0F, 0, 8, 0xA000),              /* lui  $8, 0xA000 */
             itype(0x19, 8, 8, 0x40),                /* daddiu $8, $8, 0x40 */
             itype(0x30, 8, 3, 0),                   /* ll   $3, 0($8) */
-            itype(0x37, 8, 1, 0),                   /* sc   $1, 0($8) */
+            itype(0x38, 8, 1, 0),                   /* sc   $1, 0($8) (R4300: 0x38) */
         };
         load_prog(p, 5);
         step_n(5);

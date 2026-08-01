@@ -22,3 +22,8 @@ Docs/
 FIFO/
 MaMe Files/
 qemu-3dfx/
+
+# PC-Viper firmware build output
+pcviper/firmware/*.elf
+pcviper/firmware/*.bin
+pcviper/firmware/*.o
