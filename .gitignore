@@ -1,5 +1,5 @@
 # Build artifacts
-emulator/build/
+emulator/
 build/
 
 # PC-Viper build output
@@ -24,6 +24,9 @@ Docs/
 FIFO/
 MaMe Files/
 qemu-3dfx/
+
+# Duplicate/alternate PC-Viper folders
+PC Viper/
 
 # PC-Viper firmware build output
 pcviper/firmware/*.elf
