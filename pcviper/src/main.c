@@ -136,6 +136,8 @@ static void a3d_demo(AurealA3D* a, Bus* bus) {
     printf("pcviper: aureal a3d demo (%d channels @ %d Hz)\n",
            AUREAL_CHANNELS, AUREAL_RATE);
 
+    write_wav("aureal.wav", mix, frames);
+
 #ifdef HAVE_SDL2
     if (SDL_Init(SDL_INIT_AUDIO) == 0) {
         SDL_AudioSpec want;
@@ -152,13 +154,11 @@ static void a3d_demo(AurealA3D* a, Bus* bus) {
             SDL_CloseAudioDevice(dev);
             SDL_Quit();
             printf("pcviper: played %d s of A3D audio via SDL2\n", seconds);
-            free(mix);
-            return;
+        } else {
+            SDL_Quit();
         }
-        SDL_Quit();
     }
 #endif
-    write_wav("aureal.wav", mix, frames);
     free(mix);
 }
 

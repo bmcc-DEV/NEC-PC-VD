@@ -31,23 +31,25 @@ $(BUILD)/%.o: src/%.c | $(BUILD)
 $(BUILD):
 	mkdir -p $(BUILD)
 
-tests: $(BIN)
+build-tests: $(BIN)
 	$(CC) $(CFLAGS) -o $(BUILD)/cpu_test tests/cpu_test.c src/vr5432.c src/bus.c -lm
-	./$(BUILD)/cpu_test
 	$(CC) $(CFLAGS) -o $(BUILD)/voodoo_test tests/voodoo_test.c \
 		src/voodoo2_ec.c src/voodoo_fifo.c -lm
-	./$(BUILD)/voodoo_test
 	$(CC) $(CFLAGS) -o $(BUILD)/aureal_test tests/aureal_test.c \
 		src/aureal_a3d.c src/bus.c -lm
-	./$(BUILD)/aureal_test
 	$(CC) $(CFLAGS) -o $(BUILD)/viper_test tests/viper_test.c \
 		src/viper_system.c src/bus.c -lm
-	./$(BUILD)/viper_test
 	$(CC) $(CFLAGS) -o $(BUILD)/glide_test tests/glide_test.c \
 		src/glide_api.c src/voodoo2_ec.c src/voodoo_fifo.c src/bus.c -lm
-	./$(BUILD)/glide_test
 	$(CC) $(CFLAGS) -o $(BUILD)/pipeline_test tests/pipeline_test.c \
 		src/vr5432.c src/bus.c -lm
+
+tests: build-tests
+	./$(BUILD)/cpu_test
+	./$(BUILD)/voodoo_test
+	./$(BUILD)/aureal_test
+	./$(BUILD)/viper_test
+	./$(BUILD)/glide_test
 	./$(BUILD)/pipeline_test
 	./$(BIN)
 
