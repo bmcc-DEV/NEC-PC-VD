@@ -19,7 +19,7 @@
 #include "bus.h"
 
 #define VIPER_DVD_SECTOR     2048
-#define VIPER_MEMCARD_SIZE   (8 * 1024 * 1024)   /* 8 MB per card */
+#define VIPER_MEMCARD_SIZE   (8 * 1024 * 1024)
 
 enum {
     VIPER_DMA_CTRL   = 0x000 / 4,
@@ -30,7 +30,7 @@ enum {
 
     VIPER_DVD_LBA    = 0x020 / 4,
     VIPER_DVD_COUNT  = 0x024 / 4,
-    VIPER_DVD_STATUS = 0x028 / 4,   /* bit0 ready, bit1 disk present */
+    VIPER_DVD_STATUS = 0x028 / 4,
     VIPER_DVD_IRQ    = 0x02C / 4,
 
     VIPER_MCD0_CTRL   = 0x040 / 4,
@@ -49,8 +49,8 @@ enum {
 
     VIPER_ETH_CTRL   = 0x090 / 4,
     VIPER_ETH_STATUS = 0x094 / 4,
-    VIPER_ETH_MAC0   = 0x098 / 4,   /* MAC[47:16] */
-    VIPER_ETH_MAC1   = 0x09C / 4,   /* MAC[15:0]  */
+    VIPER_ETH_MAC0   = 0x098 / 4,
+    VIPER_ETH_MAC1   = 0x09C / 4,
 };
 
 typedef struct ViperSoC ViperSoC;
@@ -60,18 +60,15 @@ void viper_soc_destroy(ViperSoC* s);
 void viper_soc_set_bus(ViperSoC* s, Bus* bus);
 void viper_soc_reset(ViperSoC* s);
 
-/* Load a DVD ISO image (2048-byte sectors). Returns 0 on success; without a
- * file a synthetic patterned disk is used. */
 int viper_soc_load_dvd(ViperSoC* s, const char* iso_path);
 uint64_t viper_soc_dvd_sectors(const ViperSoC* s);
 
-/* MMIO access: offset is a byte address within the 4 KB window */
 uint32_t viper_soc_read(ViperSoC* s, uint32_t offset);
 void viper_soc_write(ViperSoC* s, uint32_t offset, uint32_t data, uint32_t mask);
 
-/* Debug accessors */
 uint32_t viper_soc_reg_read(ViperSoC* s, int regnum);
 void viper_soc_reg_write(ViperSoC* s, int regnum, uint32_t data);
+void viper_soc_reg_write_masked(ViperSoC* s, int regnum, uint32_t data, uint32_t mask);
 const uint8_t* viper_soc_memcard(ViperSoC* s, int slot);
 
 #endif /* VIPER_SYSTEM_H */
